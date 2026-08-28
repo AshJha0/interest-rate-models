@@ -1,0 +1,25 @@
+sequenceDiagram
+  participant U as caller
+  participant B as bootstrap
+  participant R as brentq
+  participant C as trial DiscountCurve
+  participant I as instrument_k
+
+  U->>B: bootstrap([ins_1 .. ins_n]) sorted by pillar
+  B->>B: validate strictly increasing pillars
+  loop for each instrument k = 1..n
+    B->>R: solve f(x) = residual on [1e-10, 100]
+    loop Brent iterations
+      R->>C: build curve(solved pillars + (pillar_k, x))
+      C-->>I: df(t) at cashflow dates (interpolated)
+      I-->>R: residual(trial curve)
+    end
+    alt no sign change on bracket
+      R-->>B: error "root not bracketed"
+      B-->>U: error naming pillar_k (crossed quotes)
+    else converged
+      R-->>B: DF(pillar_k), |residual| < 1e-14
+      B->>B: append pillar to solved set
+    end
+  end
+  B-->>U: DiscountCurve (reprices all inputs < 1e-9)

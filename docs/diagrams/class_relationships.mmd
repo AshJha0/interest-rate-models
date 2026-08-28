@@ -1,0 +1,47 @@
+classDiagram
+  class DiscountCurve {
+    +times: float[]
+    +dfs: float[]
+    +df(t) float
+    +zero_rate(t) float
+    +inst_forward(t) float
+    +fwd_rate(t1, t2) float
+  }
+  class Deposit { +maturity +rate +pillar +residual(curve) }
+  class FRA { +start +end +rate +pillar +residual(curve) }
+  class Swap { +maturity +rate +pillar +residual(curve) }
+  class OISSwap { +maturity +rate +pillar +residual(curve) }
+  class bootstrap { <<function>> instruments -> DiscountCurve }
+  class Vasicek {
+    +kappa +theta +sigma +r0
+    +b_factor(tau) +a_factor(tau)
+    +zcb_price(T) +zero_yield(T)
+    +r_mean(T) +r_var(T)
+    +zbc(T,S,K) +zbp(T,S,K)
+    +simulate() +mc_zcb()
+  }
+  class VasicekCalibration { +kappa +theta +sigma +rmse +converged +model() }
+  class HullWhite {
+    +a +sigma +curve
+    +fwd0(t) +theta(t)
+    +b_factor(t,T) +a_factor(t,T) +zcb_price(t,T,r)
+    +zbc() +zbp() +caplet() +floorlet() +cap()
+    +jamshidian_swaption() +mc_caplet()
+  }
+  class JamshidianResult { +value +r_star +residual +strikes }
+  class brentq { <<function>> }
+  class nelder_mead { <<function>> }
+
+  Deposit ..|> Instrument
+  FRA ..|> Instrument
+  Swap ..|> Instrument
+  OISSwap ..|> Instrument
+  bootstrap --> Instrument : solves each
+  bootstrap --> brentq : DF root find
+  bootstrap --> DiscountCurve : produces
+  Instrument --> DiscountCurve : residual(trial curve)
+  HullWhite --> DiscountCurve : fitted to
+  HullWhite --> brentq : r* root find
+  HullWhite --> JamshidianResult : returns
+  Vasicek --> nelder_mead : calibration
+  Vasicek --> VasicekCalibration : returns

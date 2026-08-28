@@ -1,0 +1,41 @@
+flowchart TD
+  subgraph data["data/"]
+    CQ[curve_quotes.csv<br/>EUR + USD deposits/swaps]
+    OQ[ois_quotes.csv]
+    ZY[zero_yields.csv]
+    GJ[golden/golden.json]
+  end
+
+  subgraph curvebuild["Curve construction"]
+    L[quotes loaders] --> INS["instruments<br/>Deposit / FRA / Swap / OISSwap<br/>(validated at construction)"]
+    INS --> BS["bootstrap: per pillar<br/>solve residual(DF)=0<br/>Brent on [1e-10, 100]"]
+    BS --> DC["DiscountCurve<br/>ln-DF linear = piecewise-const forwards<br/>df / zero_rate / inst_forward / fwd_rate"]
+  end
+
+  CQ --> L
+  OQ --> L
+
+  subgraph vas["Vasicek"]
+    CAL["calibrate_vasicek<br/>Nelder-Mead least squares"] --> VM["Vasicek(kappa, theta, sigma, r0)"]
+    VM --> VP["zcb_price / zero_yield<br/>r_mean / r_var<br/>zbc / zbp"]
+    VM --> VMC["mc_zcb<br/>exact OU transitions"]
+  end
+  ZY --> CAL
+
+  subgraph hw["Hull-White (curve-fitted)"]
+    DC --> FWD["fwd0: contractual FD<br/>h = 1e-5, central/one-sided"]
+    FWD --> AB["A(t,T), B(t,T)<br/>market DFs, exact fit at t=0"]
+    AB --> OPT["zbc / zbp"]
+    OPT --> CAPS["caplet / floorlet / cap"]
+    AB --> JAM["jamshidian_swaption<br/>Brent for r*, expand bracket"]
+    OPT --> JAM
+    AB --> HMC["mc_caplet<br/>x + alpha(t), exact pathwise DF"]
+  end
+
+  VP --> TESTS["golden tests<br/>Python / C++ / Rust / Java"]
+  CAPS --> TESTS
+  JAM --> TESTS
+  DC --> TESTS
+  VMC -- "6-SE bands" --> TESTS
+  HMC -- "6-SE bands" --> TESTS
+  GJ --> TESTS
