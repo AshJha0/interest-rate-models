@@ -1,4 +1,4 @@
-# irm — Interest Rate Models (Bootstrapping, Vasicek, Hull-White)
+# Interest Rate Models (Bootstrapping, Vasicek, Hull-White)
 
 Four parallel implementations (Python reference, C++, Rust, Java) of the
 core fixed-income modeling stack: discount-curve construction from market
