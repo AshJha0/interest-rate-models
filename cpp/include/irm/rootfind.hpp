@@ -26,12 +26,16 @@ constexpr double kBrentRtol = 4.44e-16;
 ///
 /// \throws std::invalid_argument on a non-finite bracket, non-positive
 ///   xtol, or an unbracketed root.
-/// \throws std::domain_error if no convergence after \p maxiter iterations.
+/// \throws std::domain_error if no convergence after \p maxiter iterations
+///   or if \p f returns a non-finite value anywhere (an unconverged or NaN
+///   root is never returned).
 double brentq(const std::function<double(double)>& f, double a, double b,
               double xtol = 1e-14, double rtol = kBrentRtol, int maxiter = 100);
 
 /// Plain bisection on `[a, b]`; robust fallback with linear convergence.
-/// Same bracket contract as brentq().
+/// Same bracket contract as brentq(): unbracketed root / bad inputs are
+/// std::invalid_argument, non-finite values and exhausting \p maxiter are
+/// std::domain_error.
 double bisect(const std::function<double(double)>& f, double a, double b,
               double xtol = 1e-12, int maxiter = 200);
 

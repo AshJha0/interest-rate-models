@@ -1,4 +1,4 @@
-"""Native Nelder-Mead simplex minimiser (no scipy), P02-style API.
+"""Native Nelder-Mead simplex minimiser (no scipy).
 
 Used by the Vasicek least-squares calibration.  Standard coefficients:
 reflection 1, expansion 2, contraction 0.5, shrink 0.5.  Non-convergence is

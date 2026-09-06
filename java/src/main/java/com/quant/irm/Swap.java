@@ -7,7 +7,7 @@ package com.quant.irm;
  * so its PV telescopes to {@code 1 - DF(T)} (single-curve framework; a
  * documented simplification of the multi-curve/OIS-discounting reality).</p>
  *
- * @param maturity swap maturity in years, &gt; 0
+ * @param maturity swap maturity in years, within {@code [1e-6, 200]}
  * @param rate     par fixed rate (decimal)
  */
 public record Swap(double maturity, double rate) implements Instrument {

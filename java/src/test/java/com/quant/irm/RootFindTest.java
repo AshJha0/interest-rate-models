@@ -2,6 +2,7 @@ package com.quant.irm;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
 
@@ -56,7 +57,7 @@ public class RootFindTest {
         assertEquals(1.0, res.x()[0], 1e-6);
         assertEquals(1.0, res.x()[1], 1e-6);
         assertEquals(0.0, res.fx(), 1e-12);
-        org.junit.Assert.assertTrue(res.converged());
+        assertTrue(res.converged());
     }
 
     @Test
@@ -85,5 +86,38 @@ public class RootFindTest {
         for (double x = -6.0; x <= 6.0; x += 0.25) {
             assertEquals(1.0, MathUtils.normCdf(x) + MathUtils.normCdf(-x), 1e-14);
         }
+    }
+
+    @Test
+    public void brentNonConvergenceIsError() {
+        assertThrows(IllegalArgumentException.class,
+                () -> RootFind.brentq(x -> Math.tanh(1e3 * (x - 0.123456)), -10.0, 10.0, 1e-14,
+                        RootFind.DEFAULT_RTOL, 1));
+    }
+
+    @Test
+    public void bisectNonConvergenceIsError() {
+        assertThrows(IllegalArgumentException.class,
+                () -> RootFind.bisect(x -> x - 0.3, 0.0, 1.0, 1e-300, 5));
+        assertThrows(IllegalArgumentException.class,
+                () -> RootFind.bisect(x -> x, 0.0, Double.NaN));
+        assertThrows(IllegalArgumentException.class,
+                () -> RootFind.bisect(x -> x, -1.0, 1.0, 0.0, 200));
+        assertEquals(0.25, RootFind.bisect(x -> x - 0.25, 0.0, 1.0), 1e-11);
+    }
+
+    @Test
+    public void nonFiniteFunctionValuesRejected() {
+        // A NaN residual must never be returned as a "root" or misreported as
+        // a bracketing failure.
+        IllegalArgumentException exc = assertThrows(IllegalArgumentException.class,
+                () -> RootFind.brentq(
+                        x -> (x > 0.2 && x < 0.8) ? Double.NaN : (x < 0.5 ? 1.0 : -1.0),
+                        0.0, 1.0));
+        assertTrue(exc.getMessage().contains("not finite"));
+        assertThrows(IllegalArgumentException.class,
+                () -> RootFind.brentq(x -> Double.NaN, 0.0, 1.0));
+        assertThrows(IllegalArgumentException.class,
+                () -> RootFind.bisect(x -> x > 0.4 ? Double.POSITIVE_INFINITY : -1.0, 0.0, 1.0));
     }
 }

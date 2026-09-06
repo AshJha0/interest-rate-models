@@ -6,6 +6,8 @@ import pytest
 
 from irm import (
     FRA,
+    MAX_MATURITY,
+    MIN_MATURITY,
     Deposit,
     DiscountCurve,
     OISSwap,
@@ -15,6 +17,7 @@ from irm import (
     load_curve_quotes,
     load_ois_quotes,
     par_swap_rate,
+    solve_pillar_df,
 )
 
 
@@ -118,8 +121,76 @@ def test_invalid_quotes_rejected_at_construction() -> None:
 def test_crossed_quotes_fail_bracketing() -> None:
     # A -99% 2y swap after a sane 1y deposit needs DF(2) ~ 199 — outside any
     # admissible discount factor: bootstrap must raise, not return garbage.
-    with pytest.raises(ValueError, match="bootstrap failed"):
+    with pytest.raises(ValueError, match="crossed"):
         bootstrap([Deposit(1.0, 0.05), Swap(2.0, -0.99)])
+
+
+class _NanInstrument:
+    """Duck-typed instrument whose residual is NaN inside the bracket."""
+
+    rate = 0.02
+
+    @property
+    def pillar(self) -> float:
+        return 1.0
+
+    def residual(self, curve: DiscountCurve) -> float:
+        df = curve.df(1.0)
+        if 0.5 < df < 1.5:
+            return float("nan")
+        return df - 0.97
+
+
+def test_bootstrap_non_convergence_message_not_crossed_quotes() -> None:
+    # A solver failure that is not a bracketing failure must not be
+    # relabelled as crossed quotes (MINOR-10).
+    with pytest.raises(ValueError) as exc:
+        bootstrap([_NanInstrument()])
+    msg = str(exc.value)
+    assert "solver failed" in msg and "not finite" in msg
+    assert "crossed" not in msg
+    # The per-pillar kernel exposes the same classification directly.
+    with pytest.raises(ValueError, match="crossed"):
+        solve_pillar_df(lambda x: 1.0 + x, 2.0, "test")
+    with pytest.raises(ValueError, match="solver failed"):
+        solve_pillar_df(lambda x: float("inf") if x > 1.0 else -1.0, 2.0, "test")
+    assert solve_pillar_df(lambda x: x - 0.9, 2.0, "test") == pytest.approx(0.9, abs=1e-13)
+
+
+def test_swap_maturity_out_of_range_rejected() -> None:
+    for bad in (1e12, 1e9, MAX_MATURITY * (1 + 1e-9), 1e-13, MIN_MATURITY / 2.0, float("inf")):
+        with pytest.raises(ValueError):
+            Swap(bad, 0.03)
+        with pytest.raises(ValueError):
+            OISSwap(bad, 0.03)
+        with pytest.raises(ValueError):
+            Deposit(bad, 0.03)
+        with pytest.raises(ValueError):
+            FRA(0.0, bad, 0.03)
+        with pytest.raises(ValueError):
+            annual_schedule(bad)
+    # The bounds themselves are accepted and produce sane schedules.
+    assert len(annual_schedule(MAX_MATURITY)) == 200
+    assert annual_schedule(MIN_MATURITY) == (MIN_MATURITY,)
+    assert len(annual_schedule(199.5)) == 200
+
+
+def test_dv01_localises_in_quote_space(data_dir) -> None:
+    quotes = load_curve_quotes(data_dir / "curve_quotes.csv", "USD")
+    times = [0.0] + [float(i) for i in range(1, 11)]
+
+    def bumped(pillar: float, bump: float = 1e-4):
+        return bootstrap([
+            type(q)(maturity=q.maturity, rate=q.rate + (bump if q.pillar == pillar else 0.0))
+            for q in quotes
+        ])
+
+    base = par_swap_rate(bootstrap(quotes), times)
+    assert base == pytest.approx(0.0425, abs=1e-12)
+    # Bumping the 5y quote leaves the 10y par rate untouched ...
+    assert par_swap_rate(bumped(5.0), times) == pytest.approx(0.0425, abs=1e-12)
+    # ... bumping the 10y quote moves it by exactly the bump.
+    assert par_swap_rate(bumped(10.0), times) - 0.0425 == pytest.approx(1e-4, abs=1e-12)
 
 
 def test_ois_short_stub_schedule() -> None:

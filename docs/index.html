@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>interest-rate-models — Curve bootstrapping, Vasicek and Hull-White in Python, C++, Rust and Java</title>
+<!-- GitHub Pages landing page. If the repository is renamed, update the
+     github.com/AshJha0/interest-rate-models links below to match. -->
+<style>
+:root{--teal:#16697a;--green:#16a085;--ink:#1a1a2e;--muted:#556}
+body{font-family:'Segoe UI',Arial,sans-serif;margin:0;color:var(--ink);background:#f7f8fa}
+header{background:var(--teal);color:#fff;padding:3rem 2rem}
+header h1{margin:0 0 .5rem;font-size:2.2rem}
+header p{margin:0;max-width:52rem;opacity:.92;line-height:1.5}
+.wrap{max-width:64rem;margin:0 auto;padding:0 2rem}
+nav{margin-top:1.2rem}
+nav a{display:inline-block;background:var(--green);color:#fff;text-decoration:none;
+  padding:.55rem 1.1rem;margin:.25rem .6rem .25rem 0;border-radius:4px;font-weight:600}
+nav a.secondary{background:rgba(255,255,255,.15)}
+h2{color:var(--teal);border-bottom:2px solid #e3e8ec;padding-bottom:.3rem;margin-top:2.5rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(17rem,1fr));gap:1rem;margin:1.2rem 0}
+.card{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.12);padding:1rem 1.2rem;border-radius:4px}
+.card h3{margin:.1rem 0 .5rem;font-size:1.02rem;color:var(--teal)}
+.card p{margin:0;font-size:.9rem;color:var(--muted);line-height:1.45}
+pre{background:#10222a;color:#d7e3ea;padding:1rem 1.2rem;border-radius:4px;overflow-x:auto;
+  font-size:.85rem;line-height:1.5}
+.numbers{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.12);border-radius:4px;
+  padding:1rem 1.4rem;font-family:Consolas,monospace;font-size:.88rem;line-height:1.7}
+.numbers table{border-collapse:collapse}
+.numbers td{padding:.05rem 1.2rem .05rem 0;vertical-align:top}
+.numbers td:first-child{color:var(--teal);white-space:nowrap}
+.honest{background:#fff8ec;border-left:4px solid var(--green);padding:.8rem 1.2rem;
+  border-radius:4px;font-size:.92rem;line-height:1.55;margin:1.2rem 0}
+footer{margin:3rem 0 2rem;color:var(--muted);font-size:.85rem;text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>interest-rate-models</h1>
+    <p>Four parallel implementations (Python reference, C++, Rust, Java) of the core fixed-income modelling stack: discount-curve construction from deposit/FRA/swap/OIS quotes, the Vasicek short-rate model, a curve-fitted Hull-White one-factor model with caplet/swaption calibration, and the Bachelier normal model for bp-vol quoting. All four ports share one golden-value suite of 33 cases with absolute tolerances, every numerical kernel (Brent, bisection, Nelder-Mead, erfc normal CDF, exact OU moments) is implemented natively, and API_SPEC.md pins the semantics every port must honour.</p>
+    <nav>
+      <a href="https://github.com/AshJha0/interest-rate-models/blob/main/LEARN.md">Learn (guide)</a>
+      <a class="secondary" href="https://github.com/AshJha0/interest-rate-models/blob/main/COOKBOOK.md">Cookbook</a>
+      <a class="secondary" href="https://github.com/AshJha0/interest-rate-models/blob/main/docs/ARCHITECTURE.md">Architecture</a>
+      <a class="secondary" href="https://github.com/AshJha0/interest-rate-models/blob/main/API_SPEC.md">API contract</a>
+      <a class="secondary" href="https://github.com/AshJha0/interest-rate-models#references">References</a>
+      <a class="secondary" href="https://github.com/AshJha0/interest-rate-models">GitHub</a>
+      <a class="secondary" href="https://ashjha0.github.io/quant-portfolio/">Quant portfolio</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <h2>Measured, not claimed</h2>
+  <div class="numbers"><table>
+    <tr><td>Cross-language parity</td><td>python 220 · cpp 130 · rust 102 · java 162 tests — 614 green</td></tr>
+    <tr><td>Golden suite</td><td>33 named cases in one <code>golden.json</code>, one test per case in every language; absolute tolerances |got − expect| ≤ tol</td></tr>
+    <tr><td>Tolerances</td><td>curve interpolation 1e-12 to 1e-14 · closed forms (Vasicek, Hull-White, Bachelier) 1e-8 or tighter · Vasicek fit 1e-6 · Hull-White (a, sigma) recovery 1e-8</td></tr>
+    <tr><td>Monte Carlo</td><td>exact-transition sampling, no discretisation bias; golden tol = 6× the standard error at 50,000 paths — statistical, not bit-exact</td></tr>
+    <tr><td>Generator validation</td><td>bootstrapped curves reprice every quote to &lt; 1e-9 · closed forms vs 200,000-path MC within 3 SE · HW P(0,T) = market DF to 1e-12 · Bachelier vol round-trip 1e-12</td></tr>
+    <tr><td>Pinned contracts</td><td>Jamshidian |g(r*)| &lt; 1e-10 and g'(r*) &lt; 0 enforced in every port · maturities in [1e-6, 200] y · no function returns NaN or inf</td></tr>
+    <tr><td>Numerical kernels</td><td>Brent + bisection, Nelder-Mead, erfc CDF (≥ 1e-12) and expm1/series OU moments correct down to a·dt ≈ 1e-12 — all native, no external numerics</td></tr>
+    <tr><td>Feature matrix</td><td>17 feature rows × 4 languages, all ticked; error kinds mapped (ValueError / std::invalid_argument+domain_error / IrmError enum / IllegalArgumentException)</td></tr>
+  </table></div>
+
+  <div class="honest"><strong>What the latest review found and fixed.</strong> The integrated Ornstein-Uhlenbeck variance used in the exact-transition Monte Carlo cancels three O(dt) terms; the plain formula was 80× wrong at <code>a·dt = 1e-7</code> and a <code>max(·, 0)</code> guard hid it. The fix uses <code>expm1</code> plus a six-term power series below <code>a·dt ≈ 1e-2</code> (&lt; 3e-15 relative below the threshold, &lt; ~1e-11 above). The same review made the Vasicek calibration honest — three starts, <code>at_bound</code>, parameter spreads and an <code>identified</code> flag, because the bundled yields have two minima within 2 % rmse — added the <code>|g(r*)| &lt; 1e-10</code> Jamshidian contract, maturity bounds that stop a days-typed maturity from being UB in C++ / a panic in Rust / a 16 GB allocation in Java, and Hull-White calibration + Bachelier vols. Goldens were regenerated (33 cases, 7 new) and all four ports re-pinned. Still a limitation: MC streams are not bit-identical across languages; agreement is statistical only.</div>
+
+  <h2>What's inside</h2>
+  <div class="grid">
+    <div class="card"><h3>Discount curve &amp; bootstrap</h3>
+      <p><code>DiscountCurve</code> with log-linear interpolation in ln(DF) (piecewise-constant instantaneous forwards), flat-forward extrapolation, continuous zeros, instantaneous/simple forwards and a par-swap-rate helper; DF &gt; 1 is legal so negative rates are first-class. The sequential single-curve bootstrap solves each pillar from deposits, FRAs and annual par swaps (plus an OIS variant) with a native Brent root find, rejects crossed quotes by name and never relabels other solver failures.</p></div>
+    <div class="card"><h3>Vasicek short-rate model</h3>
+      <p><code>dr = kappa(theta − r)dt + sigma dW</code>: affine A/B closed-form ZCB prices and yields, exact mean/variance of r_T, the Jamshidian (1989) ZCB call/put formula, and exact-transition (bias-free) Monte Carlo of <code>(r, ∫r dt)</code> with a reported standard error. Calibration to zero yields uses native Nelder-Mead from three starts with <code>sigma_fixed</code>, <code>at_bound</code>, spread and <code>identified</code> diagnostics — non-convergence is reported, never thrown.</p></div>
+    <div class="card"><h3>Hull-White one-factor</h3>
+      <p>Fitted to a market curve: <code>theta(t)</code> from finite-difference forwards, affine ZCB via market DFs (exact reproduction at t = 0), ZBC/ZBP closed forms, caplets/floorlets as ZCB options, caps as caplet strips, Jamshidian swaption decomposition with the enforced <code>|g(r*)| &lt; 1e-10</code> contract exposed through <code>jamshidian_at_r_star</code>, tree-free exact-Gaussian MC, and <code>calibrate_hullwhite</code> fitting (a, sigma) to caplet/payer-swaption prices with an <code>a_fixed</code> option.</p></div>
+    <div class="card"><h3>Bachelier normal model</h3>
+      <p>Price and implied normal (bp) volatility for caplets and swaptions, so model prices can be compared with broker quotes; the demo reports the calibrated Hull-White model's caplet and swaption bp vols. Round-trips to 1e-12 in the data generator and is pinned in the golden suite.</p></div>
+    <div class="card"><h3>Native numerical kernels</h3>
+      <p>No external numerics in any port: Brent (zbrent) and bisection root finders that reject non-finite values and never return an unconverged root, a Nelder-Mead simplex with penalty-based domain handling, normal CDF/PDF via <code>erfc</code> (Cody's CALERF in Rust and Java), and exact OU step moments using <code>expm1</code> plus a power series so they stay correct down to <code>a·dt ~ 1e-12</code>.</p></div>
+    <div class="card"><h3>Golden suite &amp; validation</h3>
+      <p><code>data/golden/golden.json</code> holds 33 cases with flat scalar inputs and absolute tolerances; every language runs one test per case (parameterised in C++/Java/pytest, collect-all in Rust) so a single bad case never masks another. <code>generate_data.py</code> validates before writing: quotes reprice to &lt; 1e-9, closed forms agree with 200k-path MC within 3 SE, calibrations recover their generating parameters to 1e-9.</p></div>
+    <div class="card"><h3>Validation &amp; error contract</h3>
+      <p>NaN/inf in any input, non-positive DFs, unsorted or duplicate pillars, empty inputs, out-of-range maturities, wrong-length starts and non-representable results (exp overflow, DF underflow) all raise the language's standard error; every loop is bounded. <code>converged</code> is true only if tolerances were met and the solution is not on a domain boundary; price on a calibration only when <code>converged and (identified or sigma/a fixed)</code>.</p></div>
+    <div class="card"><h3>Units, conventions, scope</h3>
+      <p>Times are ACT/365F year fractions on a continuous axis; zeros are continuously compounded, deposits/FRAs/forwards simple, fixed legs annual with a short first stub; volatilities are absolute (sigma = 0.01 is 100 bp/√year). Deliberately out of scope: other day counts, calendars, IMM dates, futures convexity, multi-curve basis, smile/skew, time-dependent parameters, Bermudan exercise and analytic Greeks (DV01 is a bump-and-reprice recipe in the COOKBOOK).</p></div>
+    <div class="card"><h3>References</h3>
+      <p>Vasicek (1977); Hull &amp; White (1990); Jamshidian (1989); Brigo &amp; Mercurio (2006) for curves, caplets and the swaption decomposition; Hagan &amp; West (2006) on interpolation; Andersen &amp; Piterbarg (2010); Bachelier (1900); Gillespie (1996) for exact OU simulation; Glasserman (2003); Brent (1973) and Numerical Recipes §9.3 for zbrent; Nelder &amp; Mead (1965) and Lagarias et al. (1998); Cody (1969) for erfc; Bianchetti &amp; Carlicchi (2011) and Schrimpf &amp; Sushko (2019) for the multi-curve/RFR context.</p></div>
+    <div class="card"><h3>Guide &amp; cookbook</h3>
+      <p>LEARN.md walks from the discount curve through bootstrapping, mean reversion, Vasicek, Hull-White, DV01, desk workflow, convention gaps and numerical pitfalls to interview-style Q&amp;A, with worked examples tied to named golden cases. COOKBOOK.md recipes are checked by <code>tools/check_cookbook_snippets.py</code>, which compiles the Rust and Java snippets.</p></div>
+  </div>
+
+  <h2>Part of a wider portfolio</h2>
+  <div class="grid">
+    <div class="card"><h3><a href="https://ashjha0.github.io/quant-portfolio/" style="color:inherit">quant-portfolio</a></h3>
+      <p>The end-to-end quantitative finance portfolio this project sits alongside: 10 project
+         areas built twice each (equity + FX) in Python with C++ and Rust performance twins —
+         31 sub-projects with golden-vector cross-language validation, a 481-question learning
+         guide and a verified cookbook. <a href="https://github.com/AshJha0/quant-portfolio">GitHub&nbsp;→</a></p></div>
+    <div class="card"><h3><a href="https://ashjha0.github.io/intraday-alpha-platform/" style="color:inherit">intraday-alpha-platform</a></h3>
+      <p>A polyglot (Python/C++/Rust/Java) research-to-production intraday trading platform:
+         market data → order books → 205-feature factory → 24 alphas → validation → portfolio →
+         fail-closed risk → execution → TCA, with an adaptive drift/lifecycle layer and 1,160
+         golden-parity tests. <a href="https://github.com/AshJha0/intraday-alpha-platform">GitHub&nbsp;→</a></p></div>
+    <div class="card"><h3><a href="https://github.com/AshJha0/Quant-Finance-Library" style="color:inherit">quantfinlib</a></h3>
+      <p>A zero-dependency quantitative finance platform for the JVM — research, validation,
+         execution and connectivity, from walk-forward backtesting to a measured
+         sub-microsecond tick-to-order path, with 1,090+ tests and CI on every push.
+         <a href="https://github.com/AshJha0/Quant-Finance-Library">GitHub&nbsp;→</a></p></div>
+  </div>
+
+  <h2>Quick start</h2>
+<pre>git clone https://github.com/AshJha0/interest-rate-models &amp;&amp; cd interest-rate-models
+
+# Python reference (3.11; numpy; pytest + scipy only as test cross-checks)
+cd python
+PYTHONPATH=src python3 demo.py           # run the demo
+PYTHONPATH=src python3 -m pytest -q      # 220 passed
+cd ..
+
+# C++ (g++ 13, C++17, CMake &gt;= 3.16, GoogleTest)
+cd cpp
+bash build.sh                            # cmake -S . -B build -DCMAKE_BUILD_TYPE=Release &amp;&amp; cmake --build build -j2
+./build/demo
+ctest --test-dir build --output-on-failure   # 130 passed
+cd ..
+
+# Rust (1.95, edition 2021)
+cd rust
+cargo build --release                    # zero warnings
+cargo run --release --bin demo
+cargo test --release                     # 102 passed
+cd ..
+
+# Java (21, JUnit 4 + Hamcrest — no Maven/Gradle)
+cd java
+bash build.sh                            # javac -Xlint:all -Werror everything into out/
+bash demo.sh
+bash test.sh                             # JUnitCore on all *Test classes (162 passed)</pre>
+
+  <footer>interest-rate-models — four golden-pinned ports of curve bootstrapping, Vasicek and Hull-White, with the conventions it simplifies stated up front. See the <a href="https://github.com/AshJha0/interest-rate-models/blob/main/README.md">README</a> and the <a href="https://github.com/AshJha0/interest-rate-models/blob/main/LICENSE">MIT license</a>.</footer>
+</div>
+</body>
+</html>

@@ -3,7 +3,7 @@ package com.quant.irm;
 /**
  * Cash deposit paying simple interest {@code rate} at {@code maturity}.
  *
- * @param maturity deposit maturity in years, &gt; 0
+ * @param maturity deposit maturity in years, within {@code [1e-6, 200]}
  * @param rate     simple annual rate (decimal); must satisfy {@code 1 + R*T > 0}
  */
 public record Deposit(double maturity, double rate) implements Instrument {
@@ -13,9 +13,7 @@ public record Deposit(double maturity, double rate) implements Instrument {
         if (!Double.isFinite(rate)) {
             throw new IllegalArgumentException("quote rate must be finite, got " + rate);
         }
-        if (!Double.isFinite(maturity) || maturity <= 0.0) {
-            throw new IllegalArgumentException("deposit maturity must be > 0, got " + maturity);
-        }
+        Bootstrap.checkMaturity("deposit maturity", maturity);
         if (1.0 + rate * maturity <= 0.0) {
             throw new IllegalArgumentException(
                     "deposit quote implies non-positive discount factor (1 + R*T = "

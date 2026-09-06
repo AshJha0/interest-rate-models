@@ -7,6 +7,21 @@
 
 namespace irm {
 
+namespace {
+
+/// Reject NaN/inf function values: a silent NaN would otherwise be treated
+/// as "same sign" and either misreported as a bracketing failure or, worse,
+/// returned as a converged root.
+double finite_value(const char* who, double x, double fx) {
+    if (!std::isfinite(fx)) {
+        throw std::domain_error(std::string(who) + ": function value not finite at x=" +
+                                std::to_string(x) + ": " + std::to_string(fx));
+    }
+    return fx;
+}
+
+}  // namespace
+
 double brentq(const std::function<double(double)>& f, double a, double b,
               double xtol, double rtol, int maxiter) {
     if (!(std::isfinite(a) && std::isfinite(b))) {
@@ -15,8 +30,8 @@ double brentq(const std::function<double(double)>& f, double a, double b,
     if (!(xtol > 0.0)) {
         throw std::invalid_argument("brentq: xtol must be positive");
     }
-    double fa = f(a);
-    double fb = f(b);
+    double fa = finite_value("brentq", a, f(a));
+    double fb = finite_value("brentq", b, f(b));
     if (fa == 0.0) return a;
     if (fb == 0.0) return b;
     if ((fa > 0.0) == (fb > 0.0)) {
@@ -80,7 +95,7 @@ double brentq(const std::function<double(double)>& f, double a, double b,
         } else {
             b += (xm > 0.0) ? tol1 : -tol1;
         }
-        fb = f(b);
+        fb = finite_value("brentq", b, f(b));
     }
     throw std::domain_error("brentq: no convergence after " + std::to_string(maxiter) +
                             " iterations");
@@ -91,8 +106,11 @@ double bisect(const std::function<double(double)>& f, double a, double b,
     if (!(std::isfinite(a) && std::isfinite(b))) {
         throw std::invalid_argument("bisect: bracket endpoints must be finite");
     }
-    const double fa = f(a);
-    const double fb = f(b);
+    if (!(xtol > 0.0)) {
+        throw std::invalid_argument("bisect: xtol must be positive");
+    }
+    const double fa = finite_value("bisect", a, f(a));
+    const double fb = finite_value("bisect", b, f(b));
     if (fa == 0.0) return a;
     if (fb == 0.0) return b;
     if ((fa > 0.0) == (fb > 0.0)) {
@@ -105,7 +123,7 @@ double bisect(const std::function<double(double)>& f, double a, double b,
     double flo = (a < b) ? fa : fb;
     for (int it = 0; it < maxiter; ++it) {
         const double mid = 0.5 * (lo + hi);
-        const double fm = f(mid);
+        const double fm = finite_value("bisect", mid, f(mid));
         if (fm == 0.0 || 0.5 * (hi - lo) < xtol) {
             return mid;
         }
@@ -116,7 +134,8 @@ double bisect(const std::function<double(double)>& f, double a, double b,
             hi = mid;
         }
     }
-    return 0.5 * (lo + hi);
+    throw std::domain_error("bisect: no convergence after " + std::to_string(maxiter) +
+                            " iterations");
 }
 
 }  // namespace irm

@@ -10,7 +10,9 @@ import java.util.List;
  * <p>Bootstraps the EUR (negative short end) and USD (normal) curves plus
  * the OIS curve, prints zero/forward tables, calibrates a Vasicek model to
  * the bundled zero yields, and prices Hull-White caps and a Jamshidian
- * payer swaption. Run via {@code ./demo.sh} (after {@code ./build.sh}).</p>
+ * payer swaption, then calibrates Hull-White to caplet/swaption prices and
+ * reports normal (bp) implied vols. Run via {@code bash demo.sh} (after
+ * {@code bash build.sh}).</p>
  */
 public final class Demo {
 
@@ -60,11 +62,18 @@ public final class Demo {
         double[] ys = zy[1];
         Vasicek.Calibration cal = Vasicek.calibrate(ts, ys, 0.03);
         System.out.println();
-        System.out.println("Vasicek calibration to data/zero_yields.csv (r0 = 3%):");
+        System.out.println("Vasicek calibration to data/zero_yields.csv (r0 = 3%), 3 starts:");
         System.out.printf(
-                "  kappa=%.4f  theta=%.4f  sigma=%.4f  rmse=%.2e  iters=%d  converged=%b%n",
-                cal.kappa(), cal.theta(), cal.sigma(), cal.rmse(),
-                cal.iterations(), cal.converged());
+                "  kappa=%.4f  theta=%.4f  sigma=%.4f  rmse=%.2e  converged=%b  at_bound=%b%n",
+                cal.kappa(), cal.theta(), cal.sigma(), cal.rmse(), cal.converged(),
+                cal.atBound());
+        System.out.printf("  identified=%b  spreads across equivalent starts: kappa %.3f, "
+                + "theta %.4f, sigma %.4f%n", cal.identified(), cal.kappaSpread(),
+                cal.thetaSpread(), cal.sigmaSpread());
+        cal = Vasicek.calibrate(ts, ys, 0.03, null, 4000, 0.02);
+        System.out.println("  with sigma fixed at 0.02 (from option prices):");
+        System.out.printf("  kappa=%.4f  theta=%.4f  rmse=%.2e  converged=%b  identified=%b%n",
+                cal.kappa(), cal.theta(), cal.rmse(), cal.converged(), cal.identified());
         Vasicek model = cal.model();
         System.out.printf("  %4s %11s %9s%n", "T", "mkt yield %", "model %");
         for (int i = 0; i < ts.length; i += 3) {
@@ -111,6 +120,40 @@ public final class Demo {
                 1.0, new double[] {2.0, 3.0, 4.0}, eurPar, 100.0, true);
         System.out.printf("  EUR (negative rates) 1y-into-3y @ %.4f%%: value = %.6f, r* = %.6f%n",
                 100.0 * eurPar, eurRes.value(), eurRes.rStar());
+
+        // ---- 5. Hull-White calibration + Bachelier vols ---------------
+        System.out.println();
+        System.out.println(
+                "Hull-White calibration to USD caplet/swaption prices (a, sigma free):");
+        HullWhite truth = new HullWhite(0.08, 0.012, usd);
+        List<HullWhite.CapletQuote> caplets = new java.util.ArrayList<>();
+        for (double r : new double[] {1.0, 2.0, 4.0}) {
+            caplets.add(new HullWhite.CapletQuote(r, r + 1.0, atm,
+                    truth.caplet(r, r + 1.0, atm, 1.0)));
+        }
+        List<HullWhite.SwaptionQuote> swaptions = List.of(new HullWhite.SwaptionQuote(
+                expiry, payTimes, fwdPar,
+                truth.jamshidianSwaption(expiry, payTimes, fwdPar, 1.0, true).value()));
+        HullWhite.Calibration hcal = HullWhite.calibrate(usd, caplets, swaptions, null, null, 4000);
+        System.out.printf("  a=%.6f  sigma=%.6f  rmse=%.1e  converged=%b  identified=%b  "
+                + "(true: 0.08, 0.012)%n", hcal.a(), hcal.sigma(), hcal.rmse(), hcal.converged(),
+                hcal.identified());
+        System.out.println("  normal (bp) implied vols of the calibrated model:");
+        for (HullWhite.CapletQuote q : caplets) {
+            double fwd = usd.fwdRate(q.reset(), q.pay());
+            double ann = (q.pay() - q.reset()) * usd.df(q.pay());
+            double vol = Bachelier.impliedVol(q.price(), fwd, q.strike(), q.reset(), ann, true);
+            System.out.printf("    caplet %.0fy->%.0fy  %6.1f bp%n", q.reset(), q.pay(), 1e4 * vol);
+        }
+        double ann = 0.0;
+        double prev = expiry;
+        for (double t : payTimes) {
+            ann += (t - prev) * usd.df(t);
+            prev = t;
+        }
+        double svol = Bachelier.impliedVol(swaptions.get(0).price(), fwdPar, fwdPar, expiry, ann,
+                true);
+        System.out.printf("    1y-into-5y swaption   %6.1f bp%n", 1e4 * svol);
 
         System.out.println();
         System.out.println("done.");

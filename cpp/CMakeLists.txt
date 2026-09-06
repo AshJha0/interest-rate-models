@@ -14,6 +14,7 @@ set(IRM_DATA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../data")
 # ---- library ---------------------------------------------------------------
 add_library(irm
     src/mathutils.cpp
+    src/bachelier.cpp
     src/rootfind.cpp
     src/curve.cpp
     src/bootstrap.cpp
@@ -34,6 +35,8 @@ enable_testing()
 find_package(GTest REQUIRED)
 
 add_executable(irm_tests
+    tests/test_mathutils.cpp
+    tests/test_bachelier.cpp
     tests/test_rootfind.cpp
     tests/test_optimize.cpp
     tests/test_curve.cpp

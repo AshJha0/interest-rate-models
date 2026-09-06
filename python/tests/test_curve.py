@@ -132,3 +132,11 @@ def test_par_swap_rate(curve: DiscountCurve) -> None:
         par_swap_rate(curve, [0.0])
     with pytest.raises(ValueError):
         par_swap_rate(curve, [0.0, 2.0, 1.0])
+
+
+def test_fwd_rate_underflow_is_standard_error() -> None:
+    c = DiscountCurve([1.0], [0.95])
+    with pytest.raises(ValueError, match="not representable"):
+        c.fwd_rate(0.0, 1e6)  # DF(1e6) underflows to 0
+    # Large but representable horizons still work.
+    assert math.isfinite(c.fwd_rate(0.0, 500.0))

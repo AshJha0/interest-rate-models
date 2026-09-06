@@ -19,6 +19,15 @@ void check_rate(double rate) {
     }
 }
 
+void check_maturity(const char* what, double maturity) {
+    if (!std::isfinite(maturity) || maturity < kMinMaturity || maturity > kMaxMaturity) {
+        throw std::invalid_argument(std::string(what) + " must be finite and within [" +
+                                    std::to_string(kMinMaturity) + ", " +
+                                    std::to_string(kMaxMaturity) + "] years, got " +
+                                    std::to_string(maturity));
+    }
+}
+
 /// Shared fixed-vs-telescoped-floating residual for Swap and OISSwap:
 /// `R * annuity - (1 - DF(T))` over the annual fixed schedule.
 double swap_residual(double maturity, double rate, const DiscountCurve& curve) {
@@ -34,10 +43,8 @@ double swap_residual(double maturity, double rate, const DiscountCurve& curve) {
 }  // namespace
 
 std::vector<double> annual_schedule(double maturity) {
-    if (!std::isfinite(maturity) || maturity <= 0.0) {
-        throw std::invalid_argument("maturity must be finite and > 0, got " +
-                                    std::to_string(maturity));
-    }
+    check_maturity("maturity", maturity);
+    // maturity <= 200 here, so the float -> int conversion is in range.
     const int n = static_cast<int>(std::ceil(maturity - 1e-12));
     std::vector<double> out;
     out.reserve(static_cast<std::size_t>(n));
@@ -49,10 +56,7 @@ std::vector<double> annual_schedule(double maturity) {
 
 Deposit::Deposit(double maturity_, double rate_) : maturity(maturity_), rate(rate_) {
     check_rate(rate);
-    if (!std::isfinite(maturity) || maturity <= 0.0) {
-        throw std::invalid_argument("deposit maturity must be > 0, got " +
-                                    std::to_string(maturity));
-    }
+    check_maturity("deposit maturity", maturity);
     if (1.0 + rate * maturity <= 0.0) {
         throw std::invalid_argument("deposit quote implies non-positive discount factor (1 + R*T = " +
                                     std::to_string(1.0 + rate * maturity) + ")");
@@ -68,6 +72,7 @@ FRA::FRA(double start_, double end_, double rate_) : start(start_), end(end_), r
     if (!(std::isfinite(start) && std::isfinite(end))) {
         throw std::invalid_argument("FRA times must be finite");
     }
+    check_maturity("FRA end", end);
     if (start < 0.0 || end <= start) {
         throw std::invalid_argument("FRA needs 0 <= start < end, got start=" +
                                     std::to_string(start) + ", end=" + std::to_string(end));
@@ -122,6 +127,23 @@ std::string instrument_name(const Instrument& ins) {
     return std::visit(Namer{}, ins);
 }
 
+double solve_pillar_df(const std::function<double(double)>& residual, double pillar,
+                       const std::string& label) {
+    try {
+        return brentq(residual, kDfLo, kDfHi, 1e-14);
+    } catch (const std::exception& exc) {
+        const std::string msg = exc.what();
+        if (msg.find("not bracketed") != std::string::npos) {
+            throw std::domain_error("bootstrap failed at pillar t=" + std::to_string(pillar) +
+                                    " (" + label + "): no admissible positive discount factor in [" +
+                                    std::to_string(kDfLo) + ", " + std::to_string(kDfHi) +
+                                    "] — crossed/arbitrageable quotes? [" + msg + "]");
+        }
+        throw std::domain_error("bootstrap: solver failed at pillar t=" + std::to_string(pillar) +
+                                " (" + label + "): " + msg);
+    }
+}
+
 DiscountCurve bootstrap(const std::vector<Instrument>& instruments) {
     if (instruments.empty()) {
         throw std::invalid_argument("bootstrap needs at least one instrument");
@@ -153,16 +175,9 @@ DiscountCurve bootstrap(const std::vector<Instrument>& instruments) {
             trial_p.push_back(x);
             return instrument_residual(ins, DiscountCurve(std::move(trial_t), std::move(trial_p)));
         };
-        double df;
-        try {
-            df = brentq(objective, kDfLo, kDfHi, 1e-14);
-        } catch (const std::exception& exc) {
-            throw std::domain_error("bootstrap failed at pillar t=" + std::to_string(pillar) +
-                                    " (" + instrument_name(ins) +
-                                    ", rate=" + std::to_string(instrument_rate(ins)) +
-                                    "): no admissible positive discount factor — "
-                                    "crossed/arbitrageable quotes? [" + exc.what() + "]");
-        }
+        const double df = solve_pillar_df(
+            objective, pillar,
+            instrument_name(ins) + ", rate=" + std::to_string(instrument_rate(ins)));
         times.push_back(pillar);
         dfs.push_back(df);
     }

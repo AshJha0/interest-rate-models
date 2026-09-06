@@ -5,9 +5,11 @@ package com.quant.irm;
  *
  * <p>Contains the standard normal CDF built on Cody's rational-minimax
  * {@code erf}/{@code erfc} (netlib CALERF, relative error ~1e-16 — far
- * better than the 1e-12 absolute accuracy the API spec requires), and the
- * exact Ornstein-Uhlenbeck one-step transition moments used by both the
- * Vasicek and Hull-White Monte Carlo engines.</p>
+ * better than the 1e-12 absolute accuracy the API spec requires), the exact
+ * Ornstein-Uhlenbeck one-step transition moments used by both the Vasicek
+ * and Hull-White Monte Carlo engines, and the cancellation-free
+ * integrated-OU variance kernel shared with the Hull-White pathwise
+ * discount factor.</p>
  */
 public final class MathUtils {
 
@@ -108,6 +110,70 @@ public final class MathUtils {
         return 0.5 * erfc(-x / SQRT_2);
     }
 
+    /** Standard normal density {@code phi(x) = exp(-x^2/2) / sqrt(2 pi)}. */
+    public static double normPdf(double x) {
+        return Math.exp(-0.5 * x * x) / Math.sqrt(2.0 * Math.PI);
+    }
+
+    /**
+     * Below this value of {@code x = a * dt} the integrated-OU variance uses
+     * its power series instead of the closed form.
+     */
+    public static final double OU_SERIES_THRESHOLD = 1e-2;
+
+    // Coefficients of  x - 2(1 - e^{-x}) + (1 - e^{-2x})/2  =  x^3 * sum_k c_k x^k,
+    // c_k = (-1)^(k+3) (2 - 2^(k+2)) / (k+3)!  for k = 0, 1, ...
+    private static final double[] OU_SERIES = {
+        1.0 / 3.0, -1.0 / 4.0, 7.0 / 60.0, -1.0 / 24.0, 31.0 / 2520.0, -1.0 / 320.0};
+
+    private static void checkOuInputs(double a, double sigma, double dt) {
+        if (!(a > 0.0) || !Double.isFinite(a)) {
+            throw new IllegalArgumentException(
+                    "mean reversion must be positive and finite, got " + a);
+        }
+        if (!(dt > 0.0) || !Double.isFinite(dt)) {
+            throw new IllegalArgumentException("time step must be positive and finite, got " + dt);
+        }
+        if (!Double.isFinite(sigma)) {
+            throw new IllegalArgumentException("sigma must be finite, got " + sigma);
+        }
+    }
+
+    /**
+     * {@code Var[int_0^dt x(s) ds | x(0)]} for {@code dx = -a x dt + sigma dW}.
+     *
+     * <p>Closed form {@code (sigma^2/a^2)(dt - 2b + (1 - e^(-2 a dt))/(2a))}
+     * with {@code b = (1 - e^(-a dt))/a}. The three O(dt) terms cancel to an
+     * O(a^2 dt^3) result, which loses all precision for small {@code a*dt}
+     * (80x too large at {@code a*dt = 1e-4} in plain double arithmetic).
+     * With {@code x = a*dt}:</p>
+     * <ul>
+     *   <li>{@code x < OU_SERIES_THRESHOLD}: the series
+     *       {@code sigma^2 dt^3 (1/3 - x/4 + 7x^2/60 - x^3/24 + 31x^4/2520 - x^5/320)}
+     *       (relative truncation error below 3e-15 at the threshold);</li>
+     *   <li>otherwise the closed form written with {@code expm1} (relative
+     *       rounding error below ~1e-11 for {@code x >= 1e-2}).</li>
+     * </ul>
+     * <p>This is also {@code 2 V(t)} of the Hull-White model with {@code dt = t}.</p>
+     *
+     * @throws IllegalArgumentException unless {@code a > 0}, {@code dt > 0}
+     *     (finite) and {@code sigma} finite
+     */
+    public static double ouIntegralVariance(double a, double sigma, double dt) {
+        checkOuInputs(a, sigma, dt);
+        double x = a * dt;
+        double s2 = sigma * sigma;
+        if (x < OU_SERIES_THRESHOLD) {
+            double poly = 0.0;
+            for (int k = OU_SERIES.length - 1; k >= 0; k--) {
+                poly = poly * x + OU_SERIES[k];
+            }
+            return s2 * dt * dt * dt * poly;
+        }
+        double bracket = dt + 2.0 * Math.expm1(-x) / a + (-Math.expm1(-2.0 * x)) / (2.0 * a);
+        return Math.max((s2 / (a * a)) * bracket, 0.0);
+    }
+
     // ------------------------------------------------------------------
     // Exact Ornstein-Uhlenbeck one-step transition moments.
     // ------------------------------------------------------------------
@@ -127,7 +193,9 @@ public final class MathUtils {
      * <p>Sampling the pair from this bivariate Gaussian gives a bias-free
      * discretisation of both the short rate and its time integral, which is
      * what makes the MC zero-coupon-bond estimators unbiased at any step
-     * size.</p>
+     * size. {@code 1 - decay} terms use {@code expm1} and {@code varI} uses
+     * {@link #ouIntegralVariance}, so the moments stay accurate down to
+     * {@code a*dt ~ 1e-12}.</p>
      *
      * @param decay {@code exp(-a dt)}
      * @param b     {@code (1 - decay)/a}
@@ -142,22 +210,22 @@ public final class MathUtils {
      * Computes {@link OuStepMoments} for mean reversion {@code a > 0},
      * volatility {@code sigma >= 0} and step {@code dt > 0}.
      *
-     * @throws IllegalArgumentException if {@code a <= 0} or {@code dt <= 0}
+     * @throws IllegalArgumentException if {@code a <= 0}, {@code dt <= 0},
+     *     {@code sigma < 0} or any input is non-finite
      */
     public static OuStepMoments ouStepMoments(double a, double sigma, double dt) {
-        if (a <= 0.0) {
-            throw new IllegalArgumentException("mean reversion must be positive, got " + a);
+        checkOuInputs(a, sigma, dt);
+        if (sigma < 0.0) {
+            throw new IllegalArgumentException("sigma must be >= 0, got " + sigma);
         }
-        if (dt <= 0.0) {
-            throw new IllegalArgumentException("time step must be positive, got " + dt);
-        }
-        double decay = Math.exp(-a * dt);
-        double b = (1.0 - decay) / a;
+        double x = a * dt;
+        double decay = Math.exp(-x);
+        double oneMinusDecay = -Math.expm1(-x);
+        double b = oneMinusDecay / a;
         double s2 = sigma * sigma;
-        double varX = s2 * (1.0 - decay * decay) / (2.0 * a);
-        double varI = (s2 / (a * a)) * (dt - 2.0 * b + (1.0 - decay * decay) / (2.0 * a));
-        double cov = (s2 / (2.0 * a * a)) * (1.0 - decay) * (1.0 - decay);
-        // Guard tiny negative values from floating-point cancellation.
-        return new OuStepMoments(decay, b, Math.max(varX, 0.0), Math.max(varI, 0.0), cov);
+        double varX = s2 * (-Math.expm1(-2.0 * x)) / (2.0 * a);
+        double varI = ouIntegralVariance(a, sigma, dt);
+        double cov = (s2 / (2.0 * a * a)) * oneMinusDecay * oneMinusDecay;
+        return new OuStepMoments(decay, b, varX, varI, cov);
     }
 }

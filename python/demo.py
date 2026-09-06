@@ -2,8 +2,10 @@
 
 Bootstraps the EUR (negative short end) and USD (normal) curves plus the
 OIS curve, prints zero/forward tables, calibrates a Vasicek model to the
-bundled zero yields, and prices Hull-White caps and a Jamshidian payer
-swaption.  Run:  cd python && PYTHONPATH=src python3 demo.py
+bundled zero yields (with and without sigma fixed), prices Hull-White caps
+and a Jamshidian payer swaption, then calibrates Hull-White to
+caplet/swaption prices and reports normal (bp) implied vols.
+Run:  cd python && PYTHONPATH=src python3 demo.py
 """
 
 from __future__ import annotations
@@ -14,9 +16,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from irm import (  # noqa: E402
+    CapletQuote,
     DiscountCurve,
     HullWhite,
+    SwaptionQuote,
+    bachelier_implied_vol,
     bootstrap,
+    calibrate_hullwhite,
     calibrate_vasicek,
     load_curve_quotes,
     load_ois_quotes,
@@ -55,10 +61,20 @@ def main() -> int:
     # ---- 2. Vasicek calibration -------------------------------------- #
     ts, ys = load_zero_yields(DATA / "zero_yields.csv")
     cal = calibrate_vasicek(ts, ys, r0=0.03)
-    print("\nVasicek calibration to data/zero_yields.csv (r0 = 3%):")
+    print("\nVasicek calibration to data/zero_yields.csv (r0 = 3%), 3 starts:")
     print(
         f"  kappa={cal.kappa:.4f}  theta={cal.theta:.4f}  sigma={cal.sigma:.4f}"
-        f"  rmse={cal.rmse:.2e}  iters={cal.iterations}  converged={cal.converged}"
+        f"  rmse={cal.rmse:.2e}  converged={cal.converged}  at_bound={cal.at_bound}"
+    )
+    print(
+        f"  identified={cal.identified}  spreads across equivalent starts: "
+        f"kappa {cal.kappa_spread:.3f}, theta {cal.theta_spread:.4f}, sigma {cal.sigma_spread:.4f}"
+    )
+    cal = calibrate_vasicek(ts, ys, r0=0.03, sigma_fixed=0.02)
+    print("  with sigma fixed at 0.02 (from option prices):")
+    print(
+        f"  kappa={cal.kappa:.4f}  theta={cal.theta:.4f}  rmse={cal.rmse:.2e}"
+        f"  converged={cal.converged}  identified={cal.identified}"
     )
     model = cal.model()
     print(f"  {'T':>4} {'mkt yield %':>11} {'model %':>9}")
@@ -96,6 +112,29 @@ def main() -> int:
     eur_res = eur_hw.jamshidian_swaption(1.0, [2.0, 3.0, 4.0], eur_par, notional=100.0)
     print(f"  EUR (negative rates) 1y-into-3y @ {100*eur_par:.4f}%: "
           f"value = {eur_res.value:.6f}, r* = {eur_res.r_star:.6f}")
+
+    # ---- 5. Hull-White calibration + Bachelier vols ------------------ #
+    print("\nHull-White calibration to USD caplet/swaption prices (a, sigma free):")
+    true = HullWhite(a=0.08, sigma=0.012, curve=usd)
+    caplets = [
+        CapletQuote(r, r + 1.0, atm, true.caplet(r, r + 1.0, atm, 1.0)) for r in (1.0, 2.0, 4.0)
+    ]
+    swaptions = [SwaptionQuote(expiry, tuple(pay_times), fwd_par,
+                               true.jamshidian_swaption(expiry, pay_times, fwd_par, 1.0).value)]
+    hcal = calibrate_hullwhite(usd, caplets, swaptions)
+    print(
+        f"  a={hcal.a:.6f}  sigma={hcal.sigma:.6f}  rmse={hcal.rmse:.1e}  "
+        f"converged={hcal.converged}  identified={hcal.identified}  (true: 0.08, 0.012)"
+    )
+    print("  normal (bp) implied vols of the calibrated model:")
+    for q in caplets:
+        fwd = usd.fwd_rate(q.reset, q.pay)
+        ann = (q.pay - q.reset) * usd.df(q.pay)
+        vol = bachelier_implied_vol(q.price, fwd, q.strike, q.reset, ann)
+        print(f"    caplet {q.reset:.0f}y->{q.pay:.0f}y  {1e4 * vol:6.1f} bp")
+    ann = sum((b - a) * usd.df(b) for a, b in zip([expiry] + pay_times[:-1], pay_times))
+    vol = bachelier_implied_vol(swaptions[0].price, fwd_par, fwd_par, expiry, ann)
+    print(f"    1y-into-5y swaption   {1e4 * vol:6.1f} bp")
 
     print("\ndone.")
     return 0

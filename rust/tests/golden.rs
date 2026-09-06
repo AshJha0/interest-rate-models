@@ -7,8 +7,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use irm::{
-    bootstrap, load_curve_quotes, load_ois_quotes, par_swap_rate, DiscountCurve, HullWhite,
-    Vasicek,
+    bachelier_implied_vol, bachelier_price, bootstrap, calibrate_hullwhite, calibrate_vasicek,
+    load_curve_quotes, load_ois_quotes, load_zero_yields, par_swap_rate, CapletQuote,
+    DiscountCurve, HullWhite, SwaptionQuote, Vasicek,
 };
 use serde_json::Value;
 
@@ -109,6 +110,72 @@ fn evaluate(
         }
         return out;
     }
+    if name == "vas_calib_sigma_fixed" {
+        let (ts, ys) = load_zero_yields(&data_dir().join("zero_yields.csv")).unwrap();
+        let cal = calibrate_vasicek(&ts, &ys, num(inp, "r0"), None, 4000, Some(num(inp, "sigma_fixed")))
+            .unwrap();
+        assert!(cal.converged && cal.identified && !cal.at_bound);
+        out.insert("kappa".into(), cal.kappa);
+        out.insert("theta".into(), cal.theta);
+        return out;
+    }
+    if name.starts_with("bach_") {
+        if name == "bach_implied_vol_payer" {
+            out.insert(
+                "vol".into(),
+                bachelier_implied_vol(
+                    num(inp, "price"),
+                    num(inp, "forward"),
+                    num(inp, "strike"),
+                    num(inp, "expiry"),
+                    num(inp, "annuity"),
+                    true,
+                )
+                .unwrap(),
+            );
+        } else {
+            out.insert(
+                "price".into(),
+                bachelier_price(
+                    num(inp, "forward"),
+                    num(inp, "strike"),
+                    num(inp, "expiry"),
+                    num(inp, "vol"),
+                    num(inp, "annuity"),
+                    true,
+                )
+                .unwrap(),
+            );
+        }
+        return out;
+    }
+    if name == "hw_calib_recover" {
+        let curve = curve_from_inputs(inp);
+        let mut caps = Vec::new();
+        let mut i = 1;
+        while inp.contains_key(&format!("cap_price_{i}")) {
+            caps.push(
+                CapletQuote::new(
+                    num(inp, &format!("cap_reset_{i}")),
+                    num(inp, &format!("cap_pay_{i}")),
+                    num(inp, "strike"),
+                    num(inp, &format!("cap_price_{i}")),
+                )
+                .unwrap(),
+            );
+            i += 1;
+        }
+        let e = num(inp, "swpt_expiry");
+        let n = num(inp, "swpt_tenor_years").round() as usize;
+        let pays: Vec<f64> = (1..=n).map(|k| e + k as f64).collect();
+        let swps = [SwaptionQuote::new(e, &pays, num(inp, "swpt_fixed_rate"), num(inp, "swpt_price"))
+            .unwrap()];
+        let cal = calibrate_hullwhite(&curve, &caps, &swps, None, None, 4000).unwrap();
+        assert!(cal.converged && cal.identified && !cal.at_bound);
+        out.insert("a".into(), cal.a);
+        out.insert("sigma".into(), cal.sigma);
+        return out;
+    }
     if name.starts_with("vas_") {
         let m = vasicek_from_inputs(inp);
         match name {
@@ -149,6 +216,12 @@ fn evaluate(
             "hw_zcb_t0" => {
                 out.insert("price".into(), hw.zcb_price(0.0, num(inp, "T"), None).unwrap());
             }
+            "hw_zcb_t1_explicit_r" => {
+                out.insert(
+                    "price".into(),
+                    hw.zcb_price(num(inp, "t"), num(inp, "T"), Some(num(inp, "r"))).unwrap(),
+                );
+            }
             "hw_caplet" | "hw_caplet_sigma0" => {
                 out.insert(
                     "price".into(),
@@ -174,13 +247,14 @@ fn evaluate(
                 );
             }
             "hw_cap_3y" => {
-                let sched = [num(inp, "t0"), num(inp, "t1"), num(inp, "t2"), num(inp, "t3")];
+                // Schedule keys are s0..s3 (t1..t5 are the curve pillars).
+                let sched = [num(inp, "s0"), num(inp, "s1"), num(inp, "s2"), num(inp, "s3")];
                 out.insert(
                     "price".into(),
                     hw.cap(&sched, num(inp, "strike"), num(inp, "notional")).unwrap(),
                 );
             }
-            "hw_swaption_payer" | "hw_swaption_neg_curve" => {
+            "hw_swaption_payer" | "hw_swaption_neg_curve" | "hw_swaption_receiver" => {
                 let expiry = num(inp, "expiry");
                 let n = num(inp, "tenor_years").round() as usize;
                 let pay_times: Vec<f64> = (1..=n).map(|i| expiry + i as f64).collect();
@@ -190,10 +264,14 @@ fn evaluate(
                         &pay_times,
                         num(inp, "fixed_rate"),
                         num(inp, "notional"),
-                        true,
+                        name != "hw_swaption_receiver",
                     )
                     .unwrap();
                 out.insert("price".into(), res.value);
+                out.insert("r_star".into(), res.r_star);
+                for (i, k) in res.strikes.iter().enumerate() {
+                    out.insert(format!("strike_{}", i + 1), *k);
+                }
             }
             "hw_mc_caplet" => {
                 let n_paths = num(inp, "min_paths") as usize;
@@ -224,10 +302,13 @@ fn golden_cases() {
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     let doc: Value = serde_json::from_str(&text).expect("valid JSON");
     let cases = doc["cases"].as_array().expect("cases array");
-    assert!(cases.len() >= 20, "expected >= 20 golden cases");
+    assert_eq!(cases.len(), 33, "expected exactly 33 golden cases");
 
+    // Every case is evaluated and every failure collected, so a single bad
+    // case cannot mask the others.
     let mut names = std::collections::HashSet::new();
     let mut cache: HashMap<String, DiscountCurve> = HashMap::new();
+    let mut failures: Vec<String> = Vec::new();
     for case in cases {
         let name = case["name"].as_str().expect("case name");
         assert!(names.insert(name.to_string()), "duplicate case name {name}");
@@ -237,13 +318,17 @@ fn golden_cases() {
         let got = evaluate(name, inputs, &mut cache);
         for (key, want) in expect {
             let want = want.as_f64().expect("numeric expectation");
-            let got_v = *got
-                .get(key)
-                .unwrap_or_else(|| panic!("{name}: missing output {key}"));
-            assert!(
-                (got_v - want).abs() <= tol,
-                "{name}.{key}: got {got_v}, want {want} +- {tol}"
-            );
+            match got.get(key) {
+                None => failures.push(format!("{name}: missing output {key}")),
+                Some(&got_v) => {
+                    if !((got_v - want).abs() <= tol) {
+                        failures.push(format!(
+                            "{name}.{key}: got {got_v}, want {want} +- {tol}"
+                        ));
+                    }
+                }
+            }
         }
     }
+    assert!(failures.is_empty(), "golden failures:\n{}", failures.join("\n"));
 }

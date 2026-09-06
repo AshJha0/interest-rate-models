@@ -1,6 +1,7 @@
 package com.quant.irm;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -100,23 +101,121 @@ public class VasicekTest {
         assertTrue(m.zbc(1.0, 2.0, 0.95) >= 0.0);
     }
 
+    private static double[][] bundledYields() {
+        return Quotes.loadZeroYields(Paths.get("..", "data").resolve("zero_yields.csv"));
+    }
+
     @Test
-    public void calibrationRecoversGeneratingParameters() {
-        // data/zero_yields.csv was generated from (0.8, 0.05, 0.02, r0=0.03)
-        // plus N(0, 2e-5) noise.
-        double[][] zy = Quotes.loadZeroYields(
-                Paths.get("..", "data").resolve("zero_yields.csv"));
+    public void calibrationRecoversCleanParameters() {
+        Vasicek truth = new Vasicek(0.8, 0.05, 0.02, 0.03);
+        double[] ts = {0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0};
+        double[] ys = new double[ts.length];
+        for (int i = 0; i < ts.length; i++) {
+            ys[i] = truth.zeroYield(ts[i]);
+        }
+        Vasicek.Calibration cal = Vasicek.calibrate(ts, ys, 0.03);
+        assertTrue(cal.converged());
+        assertFalse(cal.atBound());
+        assertEquals(3, cal.nStarts());
+        assertFalse(cal.sigmaFixed());
+        assertEquals(0.8, cal.kappa(), 1e-3);
+        assertEquals(0.05, cal.theta(), 1e-4);
+        assertEquals(0.02, cal.sigma(), 1e-3);
+        assertTrue(cal.rmse() < 1e-8);
+    }
+
+    @Test
+    public void calibrationMultistartReportsNonIdentifiability() {
+        // The bundled noisy yields have two least-squares minima with rmse within
+        // 2 % of each other, at (0.80, 0.050, 0.023) and (0.41, 0.069, 0.080):
+        // the diagnostics must say so instead of claiming a unique fit.
+        double[][] zy = bundledYields();
         Vasicek.Calibration cal = Vasicek.calibrate(zy[0], zy[1], 0.03);
-        assertTrue("calibration should converge", cal.converged());
-        assertEquals(0.8, cal.kappa(), 0.15);
-        assertEquals(0.05, cal.theta(), 0.005);
-        assertTrue("rmse should be at noise level, got " + cal.rmse(),
-                cal.rmse() < 1e-4);
-        // The calibrated model reprices the target yields closely.
+        assertTrue(cal.converged());
+        assertFalse(cal.atBound());
+        assertTrue(cal.rmse() < 2e-5);
+        assertEquals(3, cal.nStarts());
+        assertFalse(cal.identified());
+        assertTrue(cal.sigmaSpread() > 0.01);
+        assertTrue(cal.kappaSpread() > 0.1);
+        assertTrue(cal.theta() >= 0.04 && cal.theta() <= 0.07);
         Vasicek m = cal.model();
         for (int i = 0; i < zy[0].length; i++) {
             assertEquals(zy[1][i], m.zeroYield(zy[0][i]), 5e-4);
         }
+        double meanY = 0.0;
+        for (double y : zy[1]) {
+            meanY += y;
+        }
+        meanY /= zy[1].length;
+        Vasicek.Calibration a = Vasicek.calibrate(
+                zy[0], zy[1], 0.03, new double[] {0.5, meanY, 0.01}, 4000, null);
+        Vasicek.Calibration b = Vasicek.calibrate(
+                zy[0], zy[1], 0.03, new double[] {0.5, 0.05, 0.05}, 4000, null);
+        assertEquals(1, a.nStarts());
+        assertTrue(a.rmse() < 2e-5 && b.rmse() < 2e-5);
+        assertTrue(Math.abs(a.rmse() - b.rmse()) < 5e-6);
+        assertTrue(Math.abs(a.sigma() - b.sigma()) > 0.01);
+        assertFalse(a.identified()); // single start: identifiability not assessed
+    }
+
+    @Test
+    public void calibrationSigmaFixedIdentifiesKappaTheta() {
+        double[][] zy = bundledYields();
+        Vasicek.Calibration cal = Vasicek.calibrate(zy[0], zy[1], 0.03, null, 4000, 0.02);
+        assertTrue(cal.sigmaFixed());
+        assertEquals(0.02, cal.sigma(), 0.0);
+        assertTrue(cal.converged() && cal.identified() && !cal.atBound());
+        assertEquals(0.8002161, cal.kappa(), 1e-6);
+        assertEquals(0.0499880, cal.theta(), 1e-6);
+        assertTrue(cal.kappaSpread() < 1e-6);
+        assertEquals(0.0, cal.sigmaSpread(), 0.0);
+        // sigmaFixed with a warm start ignores x0[2].
+        Vasicek.Calibration warm = Vasicek.calibrate(
+                zy[0], zy[1], 0.03, new double[] {0.3, 0.04, 99.0}, 4000, 0.02);
+        assertEquals(cal.kappa(), warm.kappa(), 1e-6);
+        assertEquals(0.02, warm.sigma(), 0.0);
+        assertThrows(IllegalArgumentException.class,
+                () -> Vasicek.calibrate(zy[0], zy[1], 0.03, null, 4000, -0.01));
+    }
+
+    @Test
+    public void calibrationPenaltyStartNotReportedConverged() {
+        double[][] zy = bundledYields();
+        Vasicek.Calibration cal = Vasicek.calibrate(
+                zy[0], zy[1], 0.03, new double[] {-1.0, 0.0, -1.0}, 4000, null);
+        assertTrue(cal.atBound());
+        assertFalse(cal.converged()); // stopped at the penalty wall
+        assertTrue(cal.kappa() <= 1e-5);
+        assertTrue(Double.isFinite(cal.rmse()));
+    }
+
+    @Test
+    public void calibrationFlatYieldsSigmaAtZeroBound() {
+        // Flat yields equal to r0 are fitted exactly by sigma = 0, theta = r0 for
+        // any kappa: sigma sits on its bound and kappa is not identified.
+        double[] ts = {1.0, 2.0, 3.0, 5.0, 10.0};
+        double[] ys = {0.03, 0.03, 0.03, 0.03, 0.03};
+        Vasicek.Calibration cal = Vasicek.calibrate(ts, ys, 0.03);
+        assertTrue(cal.atBound());
+        assertFalse(cal.converged());
+        assertTrue(cal.sigma() < 1e-5);
+        assertEquals(0.03, cal.theta(), 1e-8);
+        assertFalse(cal.identified());
+    }
+
+    @Test
+    public void calibrationNonConvergenceReportedNotThrown() {
+        Vasicek truth = new Vasicek(0.8, 0.05, 0.02, 0.03);
+        double[] ts = {1.0, 2.0, 5.0, 10.0};
+        double[] ys = new double[ts.length];
+        for (int i = 0; i < ts.length; i++) {
+            ys[i] = truth.zeroYield(ts[i]);
+        }
+        Vasicek.Calibration cal = Vasicek.calibrate(ts, ys, 0.03, null, 2, null);
+        assertFalse(cal.converged());
+        assertEquals(2, cal.iterations());
+        assertTrue(Double.isFinite(cal.rmse()));
     }
 
     @Test
@@ -131,6 +230,70 @@ public class VasicekTest {
         assertThrows(IllegalArgumentException.class,
                 () -> Vasicek.calibrate(new double[] {1.0, 2.0, 3.0},
                         new double[] {0.03, Double.NaN, 0.03}, 0.03));
+        assertThrows(IllegalArgumentException.class,
+                () -> Vasicek.calibrate(new double[] {1.0, 2.0, 3.0},
+                        new double[] {0.03, 0.03, 0.03}, Double.POSITIVE_INFINITY));
+        assertThrows(IllegalArgumentException.class,
+                () -> Vasicek.calibrate(new double[] {1.0, 2.0, 3.0},
+                        new double[] {0.03, 0.03, 0.03}, 0.03, null, 0, null));
+    }
+
+    @Test
+    public void calibrationX0WrongLengthOrNonFiniteRejected() {
+        double[] ts = {1.0, 2.0, 3.0};
+        double[] ys = {0.02, 0.021, 0.022};
+        // A 2-entry x0 used to throw ArrayIndexOutOfBoundsException.
+        assertThrows(IllegalArgumentException.class,
+                () -> Vasicek.calibrate(ts, ys, 0.02, new double[] {0.5, 0.03}, 4000, null));
+        assertThrows(IllegalArgumentException.class,
+                () -> Vasicek.calibrate(ts, ys, 0.02, new double[] {0.5, 0.03, 0.01, 0.0},
+                        4000, null));
+        assertThrows(IllegalArgumentException.class,
+                () -> Vasicek.calibrate(ts, ys, 0.02, new double[] {0.5, Double.NaN, 0.01},
+                        4000, null));
+    }
+
+    @Test
+    public void mcZcbManySmallStepsUnbiased() {
+        // kappa*dt = 2.5e-6 per step: the naive var_i would be wrong by orders of
+        // magnitude; with the series the estimator stays unbiased.
+        Vasicek m = new Vasicek(1e-3, 0.03, 0.01, 0.02);
+        double analytic = m.zcbPrice(5.0);
+        McEstimate est = m.mcZcb(5.0, 2000, 10_000, 77L);
+        assertTrue(est.standardError() > 0.0);
+        assertTrue(Math.abs(est.price() - analytic) < 3.0 * est.standardError());
+    }
+
+    @Test
+    public void sameSeedSameResultAndSinglePath() {
+        Vasicek m = model();
+        McEstimate a = m.mcZcb(3.0, 4, 2000, 11L);
+        McEstimate b = m.mcZcb(3.0, 4, 2000, 11L);
+        McEstimate c = m.mcZcb(3.0, 4, 2000, 12L);
+        assertEquals(a, b);
+        assertTrue(a.price() != c.price());
+        McEstimate single = m.mcZcb(1.0, 1, 1, 5L);
+        assertTrue(Double.isFinite(single.price()) && single.price() > 0.0);
+        assertEquals(0.0, single.standardError(), 0.0);
+    }
+
+    @Test
+    public void rMeanWithExplicitShortRate() {
+        Vasicek m = model();
+        assertEquals(m.rMean(2.0), m.rMean(2.0, 0.02), 0.0);
+        assertEquals(0.03 + (0.05 - 0.03) * Math.exp(-1.0), m.rMean(2.0, 0.05), 1e-15);
+        assertThrows(IllegalArgumentException.class, () -> m.rMean(2.0, Double.NaN));
+    }
+
+    @Test
+    public void nonFiniteAndOverflowRejected() {
+        Vasicek m = model();
+        assertThrows(IllegalArgumentException.class, () -> m.zcbPrice(Double.NaN));
+        assertThrows(IllegalArgumentException.class,
+                () -> m.zcbPrice(5.0, 0.0, Double.POSITIVE_INFINITY));
+        assertThrows(IllegalArgumentException.class,
+                () -> m.zeroYield(Double.POSITIVE_INFINITY));
+        assertThrows(IllegalArgumentException.class, () -> m.zcbPrice(5.0, 0.0, -1e6));
     }
 
     @Test

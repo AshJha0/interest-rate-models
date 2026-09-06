@@ -23,10 +23,39 @@ import java.util.function.ToDoubleFunction;
  * on ZCBs. Monte Carlo uses the <em>exact</em> OU transition of the pair
  * {@code (r, int r dt)} (see {@link MathUtils#ouStepMoments}), so the ZCB
  * estimator is unbiased at any step count. Calibration fits
- * {@code (kappa, theta, sigma)} to market zero yields by least squares with
- * the native {@link NelderMead}.</p>
+ * {@code (kappa, theta, sigma)} — or {@code (kappa, theta)} with sigma fixed
+ * from option prices — to market zero yields by least squares with the
+ * native {@link NelderMead}, from several starting points, and reports
+ * identifiability and boundary diagnostics.</p>
  */
 public final class Vasicek {
+
+    /** Calibration domain: kappa in (1e-6, 50], |theta| &lt;= 5, sigma in [0, 5]. */
+    public static final double KAPPA_LO = 1e-6;
+    /** Upper kappa limit of the calibration domain. */
+    public static final double KAPPA_HI = 50.0;
+    /** Absolute theta limit of the calibration domain. */
+    public static final double THETA_MAX = 5.0;
+    /** Upper sigma limit of the calibration domain. */
+    public static final double SIGMA_HI = 5.0;
+    /** Default multi-start kappa values; theta starts at the mean yield. */
+    private static final double[] START_KAPPA = {0.2, 0.5, 1.5};
+    /** Default multi-start sigma values. */
+    private static final double[] START_SIGMA = {0.005, 0.01, 0.02};
+    /** exp() argument above which a ZCB price is declared not representable. */
+    private static final double MAX_EXP_ARG = 700.0;
+    // at_bound thresholds (documented in API_SPEC section 7).
+    private static final double KAPPA_LO_BOUND = 1e-5;
+    private static final double KAPPA_HI_BOUND = 49.95;
+    private static final double THETA_BOUND = 4.995;
+    private static final double SIGMA_LO_BOUND = 1e-5;
+    private static final double SIGMA_HI_BOUND = 4.995;
+    // Starts whose rmse is within 5 % of the best are "equivalent fits".
+    private static final double EQUIV_RMSE_FACTOR = 1.05;
+    private static final double EQUIV_RMSE_FLOOR = 1e-12;
+    private static final double IDENT_KAPPA = 1e-2;
+    private static final double IDENT_THETA = 1e-3;
+    private static final double IDENT_SIGMA = 1e-3;
 
     private final double kappa;
     private final double theta;
@@ -91,8 +120,9 @@ public final class Vasicek {
     /**
      * {@code B(t,T)} with {@code tau = T - t}: duration of the ZCB w.r.t. r.
      *
-     * <p>{@code B = (1 - e^(-kappa tau))/kappa}; it is the sensitivity
-     * {@code -d ln P / d r} and appears in every option/moment formula.</p>
+     * <p>{@code B = (1 - e^(-kappa tau))/kappa} (evaluated with
+     * {@code expm1}); it is the sensitivity {@code -d ln P / d r} and appears
+     * in every option/moment formula.</p>
      *
      * @throws IllegalArgumentException unless {@code tau} is finite and &gt;= 0
      */
@@ -100,7 +130,7 @@ public final class Vasicek {
         if (!Double.isFinite(tau) || tau < 0.0) {
             throw new IllegalArgumentException("tau must be finite and >= 0, got " + tau);
         }
-        return (1.0 - Math.exp(-kappa * tau)) / kappa;
+        return -Math.expm1(-kappa * tau) / kappa;
     }
 
     /**
@@ -127,15 +157,27 @@ public final class Vasicek {
     /**
      * Zero-coupon bond price {@code P(t, maturity) = A e^(-B r)}.
      *
-     * @throws IllegalArgumentException if {@code maturity < t}
+     * @throws IllegalArgumentException on non-finite inputs, {@code maturity < t},
+     *     or when {@code exp(-B r)} would overflow (result not representable)
      */
     public double zcbPrice(double maturity, double t, double r) {
+        if (!(Double.isFinite(maturity) && Double.isFinite(t))) {
+            throw new IllegalArgumentException("maturity and t must be finite");
+        }
         if (maturity < t) {
             throw new IllegalArgumentException(
                     "maturity " + maturity + " before valuation time " + t);
         }
+        if (!Double.isFinite(r)) {
+            throw new IllegalArgumentException("short rate must be finite, got " + r);
+        }
         double tau = maturity - t;
-        return aFactor(tau) * Math.exp(-bFactor(tau) * r);
+        double expo = -bFactor(tau) * r;
+        if (expo > MAX_EXP_ARG) {
+            throw new IllegalArgumentException(
+                    "ZCB price not representable: exp(" + expo + ") overflows");
+        }
+        return aFactor(tau) * Math.exp(expo);
     }
 
     /** Continuously compounded zero yield {@code -ln P(0,T) / T} using {@code r0}. */
@@ -150,7 +192,7 @@ public final class Vasicek {
      */
     public double zeroYield(double maturity, double t, double r) {
         double tau = maturity - t;
-        if (tau <= 0.0) {
+        if (!Double.isFinite(tau) || tau <= 0.0) {
             throw new IllegalArgumentException("need maturity > t, got tau=" + tau);
         }
         return -Math.log(zcbPrice(maturity, t, r)) / tau;
@@ -164,10 +206,24 @@ public final class Vasicek {
      * @throws IllegalArgumentException on a negative or non-finite horizon
      */
     public double rMean(double horizon) {
+        return rMean(horizon, r0);
+    }
+
+    /**
+     * {@code E[r_T | r_t = r] = theta + (r - theta) e^(-kappa T)} from an
+     * explicit short rate {@code r}.
+     *
+     * @throws IllegalArgumentException on a negative or non-finite horizon or
+     *     a non-finite {@code r}
+     */
+    public double rMean(double horizon, double r) {
         if (!Double.isFinite(horizon) || horizon < 0.0) {
             throw new IllegalArgumentException("horizon must be >= 0, got " + horizon);
         }
-        return theta + (r0 - theta) * Math.exp(-kappa * horizon);
+        if (!Double.isFinite(r)) {
+            throw new IllegalArgumentException("short rate must be finite, got " + r);
+        }
+        return theta + (r - theta) * Math.exp(-kappa * horizon);
     }
 
     /**
@@ -179,7 +235,7 @@ public final class Vasicek {
         if (!Double.isFinite(horizon) || horizon < 0.0) {
             throw new IllegalArgumentException("horizon must be >= 0, got " + horizon);
         }
-        return sigma * sigma * (1.0 - Math.exp(-2.0 * kappa * horizon)) / (2.0 * kappa);
+        return sigma * sigma * (-Math.expm1(-2.0 * kappa * horizon)) / (2.0 * kappa);
     }
 
     // ----------------------------- bond options -----------------------
@@ -190,7 +246,7 @@ public final class Vasicek {
      */
     private double sigmaP(double expiry, double bondMaturity) {
         return sigma
-                * Math.sqrt((1.0 - Math.exp(-2.0 * kappa * expiry)) / (2.0 * kappa))
+                * Math.sqrt((-Math.expm1(-2.0 * kappa * expiry)) / (2.0 * kappa))
                 * bFactor(bondMaturity - expiry);
     }
 
@@ -306,7 +362,11 @@ public final class Vasicek {
         return new SimPaths(rEnd, integralR);
     }
 
-    /** MC ZCB price {@code E[e^(-int r)]} and its standard error. */
+    /**
+     * MC ZCB price {@code E[e^(-int r)]} and its standard error (sample
+     * stdev with ddof 1 over sqrt(nPaths); exactly 0 for sigma = 0 or a
+     * single path).
+     */
     public McEstimate mcZcb(double maturity, int nSteps, int nPaths, long seed) {
         SimPaths sim = simulate(maturity, nSteps, nPaths, seed);
         double[] disc = new double[nPaths];
@@ -334,17 +394,45 @@ public final class Vasicek {
     /**
      * Least-squares calibration outcome (non-convergence reported, not thrown).
      *
-     * @param kappa      fitted mean-reversion speed
-     * @param theta      fitted long-run mean
-     * @param sigma      fitted volatility (returned as {@code |sigma|})
-     * @param r0         initial short rate (held fixed)
-     * @param rmse       root-mean-square yield error
-     * @param iterations optimizer iterations
-     * @param converged  optimizer convergence flag
+     * <ul>
+     *   <li>{@code converged}: the optimiser met its tolerances at the reported
+     *       solution <em>and</em> the solution is not at a domain bound.</li>
+     *   <li>{@code atBound}: the solution sits at the edge of the calibration
+     *       domain ({@code kappa < 1e-5} or {@code > 49.95}, {@code |theta| > 4.995},
+     *       {@code sigma < 1e-5} or {@code > 4.995}) — a penalty-boundary
+     *       artefact, not a fit.</li>
+     *   <li>{@code nStarts}: Nelder-Mead starts run (3 by default; 1 with x0).</li>
+     *   <li>{@code kappaSpread} / {@code thetaSpread} / {@code sigmaSpread}: max
+     *       minus min of each parameter over the starts whose rmse is within
+     *       5 % of the best (0 for a single start).</li>
+     *   <li>{@code identified}: {@code nStarts >= 2} and all equivalent starts
+     *       agree ({@code kappaSpread <= 1e-2}, {@code thetaSpread <= 1e-3},
+     *       {@code sigmaSpread <= 1e-3}). With a single start identifiability
+     *       is not assessed and this is false.</li>
+     *   <li>{@code sigmaFixed}: true when sigma was supplied, not fitted.</li>
+     * </ul>
+     * <p>Price on the result only if {@code converged && (identified || sigmaFixed)}.</p>
+     *
+     * @param kappa       fitted mean-reversion speed
+     * @param theta       fitted long-run mean
+     * @param sigma       fitted volatility (returned as {@code |sigma|}) or the fixed value
+     * @param r0          initial short rate (held fixed)
+     * @param rmse        root-mean-square yield error
+     * @param iterations  optimizer iterations of the best start
+     * @param converged   optimizer converged and not at a bound
+     * @param atBound     solution at the edge of the domain
+     * @param nStarts     number of starts run
+     * @param kappaSpread spread of kappa over equivalent starts
+     * @param thetaSpread spread of theta over equivalent starts
+     * @param sigmaSpread spread of sigma over equivalent starts
+     * @param identified  equivalent starts agree (multi-start only)
+     * @param sigmaFixed  sigma held fixed at the supplied value
      */
     public record Calibration(
             double kappa, double theta, double sigma, double r0,
-            double rmse, int iterations, boolean converged) {
+            double rmse, int iterations, boolean converged, boolean atBound, int nStarts,
+            double kappaSpread, double thetaSpread, double sigmaSpread, boolean identified,
+            boolean sigmaFixed) {
 
         /** Builds the calibrated model. */
         public Vasicek model() {
@@ -352,10 +440,16 @@ public final class Vasicek {
         }
     }
 
-    /** {@link #calibrate(double[], double[], double, double[], int)} with the
-     *  default start {@code (0.5, mean(yields), 0.01)} and {@code maxiter = 4000}. */
+    /** One Nelder-Mead start's outcome. */
+    private record StartResult(
+            double fx, double kappa, double theta, double sigma, int iterations,
+            boolean converged) {
+    }
+
+    /** {@link #calibrate(double[], double[], double, double[], int, Double)} with the
+     *  three default starts, {@code maxiter = 4000} and sigma free. */
     public static Calibration calibrate(double[] maturities, double[] yields, double r0) {
-        return calibrate(maturities, yields, r0, null, 4000);
+        return calibrate(maturities, yields, r0, null, 4000, null);
     }
 
     /**
@@ -363,16 +457,29 @@ public final class Vasicek {
      *
      * <p>Minimises {@code sum_i (y_model(T_i) - y_i)^2} with Nelder-Mead
      * ({@code initialStep = 0.05}); out-of-domain points get a smooth penalty
-     * pointing back toward the feasible region. {@code r0} is held fixed;
-     * non-convergence is reported via the result flag, never thrown.</p>
+     * pointing back toward the feasible region. {@code r0} is held fixed.</p>
+     * <ul>
+     *   <li>{@code x0 == null}: three starts {@code (kappa, mean(y), sigma)} for
+     *       {@code (kappa, sigma)} in {@code {(0.2, 0.005), (0.5, 0.01), (1.5, 0.02)}};
+     *       the lowest objective is returned with the parameter spreads across
+     *       equivalent starts.</li>
+     *   <li>{@code x0 = {kappa, theta, sigma}}: a single warm start (exactly 3
+     *       finite entries; identifiability is then not assessed).</li>
+     *   <li>{@code sigmaFixed != null}: fit only {@code (kappa, theta)} with sigma
+     *       held at the given value ({@code >= 0}) — the practitioner workflow;
+     *       {@code x0[2]} is ignored.</li>
+     * </ul>
+     * <p>Yields identify the parameters weakly (the bundled data has two minima
+     * with rmse within 2 %); always check {@code converged}, {@code atBound}
+     * and {@code identified}. Non-convergence is reported, never thrown.</p>
      *
-     * @param x0 optional start point {@code (kappa, theta, sigma)}; when null
-     *     the default {@code (0.5, mean(yields), 0.01)} is used
      * @throws IllegalArgumentException on fewer than 3 points, length
-     *     mismatch, or non-finite/non-positive inputs
+     *     mismatch, non-finite/non-positive inputs, a wrong-length or non-finite
+     *     x0, a negative sigmaFixed, or {@code maxiter < 1}
      */
     public static Calibration calibrate(
-            double[] maturities, double[] yields, double r0, double[] x0, int maxiter) {
+            double[] maturities, double[] yields, double r0, double[] x0, int maxiter,
+            Double sigmaFixed) {
         if (maturities == null || yields == null
                 || maturities.length != yields.length || maturities.length < 3) {
             throw new IllegalArgumentException(
@@ -393,6 +500,25 @@ public final class Vasicek {
         if (!Double.isFinite(r0)) {
             throw new IllegalArgumentException("r0 must be finite");
         }
+        if (maxiter < 1) {
+            throw new IllegalArgumentException("maxiter must be >= 1");
+        }
+        if (x0 != null) {
+            if (x0.length != 3) {
+                throw new IllegalArgumentException("x0 must have 3 entries (kappa, theta, sigma)");
+            }
+            for (double v : x0) {
+                if (!Double.isFinite(v)) {
+                    throw new IllegalArgumentException("x0 must be finite");
+                }
+            }
+        }
+        if (sigmaFixed != null && (!Double.isFinite(sigmaFixed) || sigmaFixed < 0.0)) {
+            throw new IllegalArgumentException(
+                    "sigmaFixed must be finite and >= 0, got " + sigmaFixed);
+        }
+        final boolean fixed = sigmaFixed != null;
+        final double sigmaFix = fixed ? sigmaFixed : Double.NaN;
         final double[] ts = maturities.clone();
         final double[] ys = yields.clone();
         final double r0f = r0;
@@ -400,16 +526,16 @@ public final class Vasicek {
         ToDoubleFunction<double[]> objective = p -> {
             double kappa = p[0];
             double theta = p[1];
-            double sigma = p[2];
-            if (kappa <= 1e-6 || sigma < 0.0 || kappa > 50.0
-                    || Math.abs(theta) > 5.0 || sigma > 5.0) {
+            double sigma = fixed ? sigmaFix : p[2];
+            if (kappa <= KAPPA_LO || sigma < 0.0 || kappa > KAPPA_HI
+                    || Math.abs(theta) > THETA_MAX || sigma > SIGMA_HI) {
                 // Smooth penalty pointing back toward the feasible region.
                 return 1e6 * (1.0
-                        + Math.max(0.0, 1e-6 - kappa)
+                        + Math.max(0.0, KAPPA_LO - kappa)
                         + Math.max(0.0, -sigma)
-                        + Math.max(0.0, kappa - 50.0)
-                        + Math.max(0.0, Math.abs(theta) - 5.0)
-                        + Math.max(0.0, sigma - 5.0));
+                        + Math.max(0.0, kappa - KAPPA_HI)
+                        + Math.max(0.0, Math.abs(theta) - THETA_MAX)
+                        + Math.max(0.0, sigma - SIGMA_HI));
             }
             Vasicek model = new Vasicek(kappa, theta, sigma, r0f);
             double sse = 0.0;
@@ -420,13 +546,61 @@ public final class Vasicek {
             return sse;
         };
 
-        double[] start = (x0 != null) ? x0.clone()
-                : new double[] {0.5, ySum / ys.length, 0.01};
-        NelderMead.Result res =
-                NelderMead.minimize(objective, start, 0.05, 1e-10, 1e-14, maxiter);
-        double[] best = res.x();
-        double rmse = Math.sqrt(Math.max(res.fx(), 0.0) / ts.length);
-        return new Calibration(
-                best[0], best[1], Math.abs(best[2]), r0, rmse, res.iterations(), res.converged());
+        double meanY = ySum / ys.length;
+        double[][] starts;
+        if (x0 != null) {
+            starts = new double[][] {x0.clone()};
+        } else {
+            starts = new double[3][];
+            for (int k = 0; k < 3; k++) {
+                starts[k] = new double[] {START_KAPPA[k], meanY, START_SIGMA[k]};
+            }
+        }
+        StartResult[] results = new StartResult[starts.length];
+        for (int k = 0; k < starts.length; k++) {
+            double[] p0 = fixed ? new double[] {starts[k][0], starts[k][1]} : starts[k];
+            NelderMead.Result res = NelderMead.minimize(objective, p0, 0.05, 1e-10, 1e-14, maxiter);
+            double[] best = res.x();
+            double sigma = fixed ? sigmaFix : Math.abs(best[2]);
+            results[k] = new StartResult(
+                    res.fx(), best[0], best[1], sigma, res.iterations(), res.converged());
+        }
+        int bestIdx = 0;
+        for (int k = 1; k < results.length; k++) {
+            if (results[k].fx() < results[bestIdx].fx()) {
+                bestIdx = k;
+            }
+        }
+        StartResult b = results[bestIdx];
+        double n = ts.length;
+        double rmse = Math.sqrt(Math.max(b.fx(), 0.0) / n);
+        boolean atBound = b.kappa() < KAPPA_LO_BOUND || b.kappa() > KAPPA_HI_BOUND
+                || Math.abs(b.theta()) > THETA_BOUND
+                || (!fixed && (b.sigma() < SIGMA_LO_BOUND || b.sigma() > SIGMA_HI_BOUND));
+        double kLo = b.kappa();
+        double kHi = b.kappa();
+        double tLo = b.theta();
+        double tHi = b.theta();
+        double sLo = b.sigma();
+        double sHi = b.sigma();
+        for (StartResult r : results) {
+            double rRmse = Math.sqrt(Math.max(r.fx(), 0.0) / n);
+            if (rRmse <= EQUIV_RMSE_FACTOR * rmse + EQUIV_RMSE_FLOOR) {
+                kLo = Math.min(kLo, r.kappa());
+                kHi = Math.max(kHi, r.kappa());
+                tLo = Math.min(tLo, r.theta());
+                tHi = Math.max(tHi, r.theta());
+                sLo = Math.min(sLo, r.sigma());
+                sHi = Math.max(sHi, r.sigma());
+            }
+        }
+        double kappaSpread = kHi - kLo;
+        double thetaSpread = tHi - tLo;
+        double sigmaSpread = sHi - sLo;
+        boolean identified = results.length >= 2 && kappaSpread <= IDENT_KAPPA
+                && thetaSpread <= IDENT_THETA && sigmaSpread <= IDENT_SIGMA;
+        return new Calibration(b.kappa(), b.theta(), b.sigma(), r0, rmse, b.iterations(),
+                b.converged() && !atBound, atBound, results.length,
+                kappaSpread, thetaSpread, sigmaSpread, identified, fixed);
     }
 }

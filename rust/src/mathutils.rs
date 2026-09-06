@@ -2,9 +2,10 @@
 //!
 //! Contains a native `erfc` (Cody's rational-Chebyshev CALERF algorithm,
 //! ~1e-16 relative accuracy — Rust's standard library has no error
-//! function), the standard normal CDF built on it, and the exact
+//! function), the standard normal CDF/PDF built on it, the exact
 //! Ornstein-Uhlenbeck transition moments used by both the Vasicek and the
-//! Hull-White Monte Carlo engines.
+//! Hull-White Monte Carlo engines, and the cancellation-free integrated-OU
+//! variance kernel shared with the Hull-White pathwise discount factor.
 
 use crate::error::{IrmError, Result};
 
@@ -129,6 +130,74 @@ pub fn norm_cdf(x: f64) -> f64 {
     0.5 * erfc(-x / SQRT_2)
 }
 
+/// Standard normal density `phi(x) = exp(-x^2/2) / sqrt(2 pi)`.
+pub fn norm_pdf(x: f64) -> f64 {
+    (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
+}
+
+/// Below this value of `x = a * dt` the integrated-OU variance uses its
+/// power series instead of the closed form (see [`ou_integral_variance`]).
+pub const OU_SERIES_THRESHOLD: f64 = 1e-2;
+
+// Coefficients of  x - 2(1 - e^{-x}) + (1 - e^{-2x})/2  =  x^3 * sum_k c_k x^k,
+// c_k = (-1)^(k+3) (2 - 2^(k+2)) / (k+3)!  for k = 0, 1, ...
+const OU_SERIES: [f64; 6] = [
+    1.0 / 3.0,
+    -1.0 / 4.0,
+    7.0 / 60.0,
+    -1.0 / 24.0,
+    31.0 / 2520.0,
+    -1.0 / 320.0,
+];
+
+fn check_ou_inputs(a: f64, sigma: f64, dt: f64) -> Result<()> {
+    if !(a > 0.0) || !a.is_finite() {
+        return Err(IrmError::InvalidInput(format!(
+            "mean reversion must be positive and finite, got {a}"
+        )));
+    }
+    if !(dt > 0.0) || !dt.is_finite() {
+        return Err(IrmError::InvalidInput(format!(
+            "time step must be positive and finite, got {dt}"
+        )));
+    }
+    if !sigma.is_finite() {
+        return Err(IrmError::InvalidInput(format!(
+            "sigma must be finite, got {sigma}"
+        )));
+    }
+    Ok(())
+}
+
+/// `Var[int_0^dt x(s) ds | x(0)]` for `dx = -a x dt + sigma dW`.
+///
+/// Closed form `(sigma^2/a^2)(dt - 2b + (1 - e^{-2 a dt})/(2a))` with
+/// `b = (1 - e^{-a dt})/a`.  The three O(dt) terms cancel to an O(a^2 dt^3)
+/// result, which loses all precision for small `a*dt` (80x too large at
+/// `a*dt = 1e-4` in plain double arithmetic).  With `x = a*dt`:
+///
+/// * `x < OU_SERIES_THRESHOLD`: the series
+///   `sigma^2 dt^3 (1/3 - x/4 + 7x^2/60 - x^3/24 + 31x^4/2520 - x^5/320)`
+///   (relative truncation error < 3e-15 at the threshold);
+/// * otherwise the closed form written with `exp_m1` (relative rounding
+///   error below ~1e-11 for `x >= 1e-2`).
+///
+/// This is also `2 V(t)` of the Hull-White model with `dt = t`.
+pub fn ou_integral_variance(a: f64, sigma: f64, dt: f64) -> Result<f64> {
+    check_ou_inputs(a, sigma, dt)?;
+    let x = a * dt;
+    let s2 = sigma * sigma;
+    if x < OU_SERIES_THRESHOLD {
+        let mut poly = 0.0;
+        for c in OU_SERIES.iter().rev() {
+            poly = poly * x + c;
+        }
+        return Ok(s2 * dt * dt * dt * poly);
+    }
+    let bracket = dt + 2.0 * (-x).exp_m1() / a + (-(-2.0 * x).exp_m1()) / (2.0 * a);
+    Ok(((s2 / (a * a)) * bracket).max(0.0))
+}
+
 // ------------------------------------------------------------------ //
 // Exact OU transition moments.
 // ------------------------------------------------------------------ //
@@ -146,7 +215,10 @@ pub fn norm_cdf(x: f64) -> f64 {
 /// Sampling the pair `(x_next, I)` from this bivariate Gaussian gives an
 /// *exact* (bias-free) discretisation of both the short rate and its time
 /// integral — which is what makes the MC bond estimators unbiased at any
-/// step size.
+/// step size.  `1 - decay` terms use `exp_m1` and `var_i` uses
+/// [`ou_integral_variance`], so the moments stay accurate down to
+/// `a*dt ~ 1e-12` (plain evaluation is wrong by orders of magnitude below
+/// `a*dt ~ 1e-3`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OuStepMoments {
     /// `exp(-a dt)`.
@@ -161,25 +233,23 @@ pub struct OuStepMoments {
     pub cov: f64,
 }
 
-/// Compute [`OuStepMoments`] for mean reversion `a > 0` and step `dt > 0`.
+/// Compute [`OuStepMoments`] for mean reversion `a > 0`, `sigma >= 0` and
+/// step `dt > 0` (all finite).
 pub fn ou_step_moments(a: f64, sigma: f64, dt: f64) -> Result<OuStepMoments> {
-    if a <= 0.0 {
+    check_ou_inputs(a, sigma, dt)?;
+    if sigma < 0.0 {
         return Err(IrmError::InvalidInput(format!(
-            "mean reversion must be positive, got {a}"
+            "sigma must be >= 0, got {sigma}"
         )));
     }
-    if dt <= 0.0 {
-        return Err(IrmError::InvalidInput(format!(
-            "time step must be positive, got {dt}"
-        )));
-    }
-    let decay = (-a * dt).exp();
-    let b = (1.0 - decay) / a;
+    let x = a * dt;
+    let decay = (-x).exp();
+    let one_minus_decay = -(-x).exp_m1();
+    let b = one_minus_decay / a;
     let s2 = sigma * sigma;
-    // Guard tiny negatives from floating-point cancellation.
-    let var_x = (s2 * (1.0 - decay * decay) / (2.0 * a)).max(0.0);
-    let var_i = ((s2 / (a * a)) * (dt - 2.0 * b + (1.0 - decay * decay) / (2.0 * a))).max(0.0);
-    let cov = (s2 / (2.0 * a * a)) * (1.0 - decay) * (1.0 - decay);
+    let var_x = s2 * (-(-2.0 * x).exp_m1()) / (2.0 * a);
+    let var_i = ou_integral_variance(a, sigma, dt)?;
+    let cov = (s2 / (2.0 * a * a)) * one_minus_decay * one_minus_decay;
     Ok(OuStepMoments {
         decay,
         b,

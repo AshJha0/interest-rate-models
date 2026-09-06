@@ -10,7 +10,7 @@ package com.quant.irm;
  * {@link Swap}. The daily-vs-continuous compounding gap is
  * {@code O(rate^2 / 365)} and is a documented approximation.</p>
  *
- * @param maturity swap maturity in years, &gt; 0
+ * @param maturity swap maturity in years, within {@code [1e-6, 200]}
  * @param rate     par fixed rate (decimal)
  */
 public record OisSwap(double maturity, double rate) implements Instrument {

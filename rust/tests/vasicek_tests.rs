@@ -155,8 +155,10 @@ fn calibration_recovers_parameters() {
         .iter()
         .map(|&t| truth.zero_yield(t, 0.0, None).unwrap())
         .collect();
-    let res = calibrate_vasicek(&ts, &ys, 0.03, None, 4000).unwrap();
-    assert!(res.converged);
+    let res = calibrate_vasicek(&ts, &ys, 0.03, None, 4000, None).unwrap();
+    assert!(res.converged && !res.at_bound);
+    assert_eq!(res.n_starts, 3);
+    assert!(!res.sigma_fixed);
     assert!(res.rmse < 1e-7);
     assert!((res.kappa - 0.8).abs() < 2e-3);
     assert!((res.theta - 0.05).abs() < 2e-3);
@@ -169,13 +171,107 @@ fn calibration_recovers_parameters() {
 }
 
 #[test]
-fn calibration_from_bundled_csv() {
+fn calibration_multistart_reports_non_identifiability() {
+    // The bundled noisy yields have two least-squares minima with rmse within
+    // 2 % of each other, at (0.80, 0.050, 0.023) and (0.41, 0.069, 0.080):
+    // the diagnostics must say so instead of claiming a unique fit.
     let (ts, ys) = load_zero_yields(&data_dir().join("zero_yields.csv")).unwrap();
-    let res = calibrate_vasicek(&ts, &ys, 0.03, None, 4000).unwrap();
-    assert!(res.converged);
-    assert!(res.rmse < 1e-4);
-    assert!((res.kappa - 0.8).abs() / 0.8 < 0.2);
+    let res = calibrate_vasicek(&ts, &ys, 0.03, None, 4000, None).unwrap();
+    assert!(res.converged && !res.at_bound);
+    assert!(res.rmse < 2e-5);
+    assert_eq!(res.n_starts, 3);
+    assert!(!res.identified);
+    assert!(res.sigma_spread > 0.01);
+    assert!(res.kappa_spread > 0.1);
+    assert!((0.04..=0.07).contains(&res.theta));
+    let mean_y = ys.iter().sum::<f64>() / ys.len() as f64;
+    let a = calibrate_vasicek(&ts, &ys, 0.03, Some([0.5, mean_y, 0.01]), 4000, None).unwrap();
+    let b = calibrate_vasicek(&ts, &ys, 0.03, Some([0.5, 0.05, 0.05]), 4000, None).unwrap();
+    assert_eq!(a.n_starts, 1);
+    assert!(a.rmse < 2e-5 && b.rmse < 2e-5);
+    assert!((a.rmse - b.rmse).abs() < 5e-6);
+    assert!((a.sigma - b.sigma).abs() > 0.01);
+    assert!(!a.identified); // single start: identifiability not assessed
 }
+
+#[test]
+fn calibration_sigma_fixed_identifies_kappa_theta() {
+    let (ts, ys) = load_zero_yields(&data_dir().join("zero_yields.csv")).unwrap();
+    let res = calibrate_vasicek(&ts, &ys, 0.03, None, 4000, Some(0.02)).unwrap();
+    assert!(res.sigma_fixed && res.sigma == 0.02);
+    assert!(res.converged && res.identified && !res.at_bound);
+    assert!((res.kappa - 0.8002161).abs() < 1e-6);
+    assert!((res.theta - 0.0499880).abs() < 1e-6);
+    assert!(res.kappa_spread < 1e-6 && res.sigma_spread == 0.0);
+    let warm = calibrate_vasicek(&ts, &ys, 0.03, Some([0.3, 0.04, 99.0]), 4000, Some(0.02)).unwrap();
+    assert!((warm.kappa - res.kappa).abs() < 1e-6);
+    assert_eq!(warm.sigma, 0.02);
+    assert!(calibrate_vasicek(&ts, &ys, 0.03, None, 4000, Some(-0.01)).is_err());
+}
+
+#[test]
+fn calibration_penalty_start_not_reported_converged() {
+    let (ts, ys) = load_zero_yields(&data_dir().join("zero_yields.csv")).unwrap();
+    let res = calibrate_vasicek(&ts, &ys, 0.03, Some([-1.0, 0.0, -1.0]), 4000, None).unwrap();
+    assert!(res.at_bound);
+    assert!(!res.converged); // stopped at the penalty wall
+    assert!(res.kappa <= 1e-5);
+    assert!(res.rmse.is_finite());
+}
+
+#[test]
+fn calibration_flat_yields_sigma_at_zero_bound() {
+    let ts = [1.0, 2.0, 3.0, 5.0, 10.0];
+    let ys = [0.03; 5];
+    let res = calibrate_vasicek(&ts, &ys, 0.03, None, 4000, None).unwrap();
+    assert!(res.at_bound && !res.converged);
+    assert!(res.sigma < 1e-5);
+    assert!((res.theta - 0.03).abs() < 1e-8);
+    assert!(!res.identified);
+}
+
+#[test]
+fn calibration_x0_non_finite_and_maxiter_rejected() {
+    // x0 is a fixed-size array: the wrong-length case is a compile error.
+    let (ts, ys) = ([1.0, 2.0, 3.0], [0.02, 0.021, 0.022]);
+    assert!(calibrate_vasicek(&ts, &ys, 0.02, Some([0.5, f64::NAN, 0.01]), 100, None).is_err());
+    assert!(calibrate_vasicek(&ts, &ys, 0.02, None, 0, None).is_err());
+}
+
+#[test]
+fn mc_zcb_many_small_steps_unbiased() {
+    // kappa*dt = 2.5e-6 per step: the naive var_i would be wrong by orders of
+    // magnitude; with the series the estimator stays unbiased.
+    let m = Vasicek::new(1e-3, 0.03, 0.01, 0.02).unwrap();
+    let analytic = m.zcb_price(5.0, 0.0, None).unwrap();
+    let (price, se) = m.mc_zcb(5.0, 2000, 10_000, 77).unwrap();
+    assert!(se > 0.0);
+    assert!((price - analytic).abs() < 3.0 * se, "MC {price} vs {analytic}, se {se}");
+}
+
+#[test]
+fn same_seed_same_result_and_single_path() {
+    let m = model();
+    let a = m.mc_zcb(3.0, 4, 2000, 11).unwrap();
+    let b = m.mc_zcb(3.0, 4, 2000, 11).unwrap();
+    let c = m.mc_zcb(3.0, 4, 2000, 12).unwrap();
+    assert_eq!(a, b);
+    assert_ne!(a, c);
+    let (price, se) = m.mc_zcb(1.0, 1, 1, 5).unwrap();
+    assert!(price.is_finite() && price > 0.0);
+    assert_eq!(se, 0.0);
+}
+
+#[test]
+fn non_finite_and_overflow_rejected() {
+    let m = model();
+    assert!(m.zcb_price(f64::NAN, 0.0, None).is_err());
+    assert!(m.zcb_price(5.0, 0.0, Some(f64::INFINITY)).is_err());
+    assert!(m.r_mean(1.0, Some(f64::NAN)).is_err());
+    assert!(m.zero_yield(f64::INFINITY, 0.0, None).is_err());
+    assert!(m.zcb_price(5.0, 0.0, Some(-1e6)).is_err()); // exp overflow
+}
+
 
 #[test]
 fn calibration_non_convergence_reported_not_error() {
@@ -185,17 +281,24 @@ fn calibration_non_convergence_reported_not_error() {
         .iter()
         .map(|&t| truth.zero_yield(t, 0.0, None).unwrap())
         .collect();
-    let res = calibrate_vasicek(&ts, &ys, 0.03, None, 2).unwrap();
+    let res = calibrate_vasicek(&ts, &ys, 0.03, None, 2, None).unwrap();
     assert!(!res.converged); // reported, no error
+    assert_eq!(res.iterations, 2);
     assert!(res.rmse.is_finite());
 }
 
 #[test]
 fn calibration_input_validation() {
-    assert!(calibrate_vasicek(&[1.0, 2.0], &[0.02, 0.03], 0.02, None, 100).is_err());
-    assert!(calibrate_vasicek(&[1.0, -2.0, 3.0], &[0.02, 0.03, 0.03], 0.02, None, 100).is_err());
+    assert!(calibrate_vasicek(&[1.0, 2.0], &[0.02, 0.03], 0.02, None, 100, None).is_err());
     assert!(
-        calibrate_vasicek(&[1.0, 2.0, 3.0], &[0.02, f64::NAN, 0.03], 0.02, None, 100).is_err()
+        calibrate_vasicek(&[1.0, -2.0, 3.0], &[0.02, 0.03, 0.03], 0.02, None, 100, None).is_err()
     );
-    assert!(calibrate_vasicek(&[1.0, 2.0, 3.0], &[0.02, 0.02, 0.03], f64::NAN, None, 100).is_err());
+    assert!(
+        calibrate_vasicek(&[1.0, 2.0, 3.0], &[0.02, f64::NAN, 0.03], 0.02, None, 100, None)
+            .is_err()
+    );
+    assert!(
+        calibrate_vasicek(&[1.0, 2.0, 3.0], &[0.02, 0.02, 0.03], f64::NAN, None, 100, None)
+            .is_err()
+    );
 }

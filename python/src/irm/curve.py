@@ -139,7 +139,15 @@ class DiscountCurve:
             raise ValueError(
                 f"need 0 <= t1 < t2 for a forward rate, got t1={t1}, t2={t2}"
             )
-        return (self.df(t1) / self.df(t2) - 1.0) / (t2 - t1)
+        df1, df2 = self.df(t1), self.df(t2)
+        if df2 == 0.0:
+            raise ValueError(
+                f"forward rate over [{t1}, {t2}] not representable: DF({t2}) underflowed to 0"
+            )
+        fwd = (df1 / df2 - 1.0) / (t2 - t1)
+        if not math.isfinite(fwd):
+            raise ValueError(f"forward rate over [{t1}, {t2}] not representable: {fwd}")
+        return fwd
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"DiscountCurve(pillars={len(self.times)}, last_t={self.times[-1]})"

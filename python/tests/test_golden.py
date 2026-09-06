@@ -13,7 +13,19 @@ from typing import Dict
 
 import pytest
 
-from irm import DiscountCurve, HullWhite, Vasicek, par_swap_rate
+from irm import (
+    CapletQuote,
+    DiscountCurve,
+    HullWhite,
+    SwaptionQuote,
+    Vasicek,
+    bachelier_implied_vol,
+    bachelier_price,
+    calibrate_hullwhite,
+    calibrate_vasicek,
+    load_zero_yields,
+    par_swap_rate,
+)
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 
@@ -75,6 +87,11 @@ def evaluate(name: str, inp: Dict[str, float]) -> Dict[str, float]:
         if "zero" in name:
             return {"zero": c.zero_rate(inp["t"])}
         return {"df": c.df(inp["t"])}
+    if name == "vas_calib_sigma_fixed":
+        ts, ys = load_zero_yields(DATA_DIR / "zero_yields.csv")
+        cal = calibrate_vasicek(ts, ys, inp["r0"], sigma_fixed=inp["sigma_fixed"])
+        assert cal.converged and cal.identified and not cal.at_bound
+        return {"kappa": cal.kappa, "theta": cal.theta}
     if name.startswith("vas_"):
         m = _vasicek_from_inputs(inp)
         if name == "vas_rT_mean":
@@ -89,23 +106,49 @@ def evaluate(name: str, inp: Dict[str, float]) -> Dict[str, float]:
             price, _ = m.mc_zcb(inp["T"], n_steps=8, n_paths=int(inp["min_paths"]), seed=901)
             return {"price": price}
         return {"price": m.zcb_price(inp["T"])}
+    if name.startswith("bach_"):
+        if name == "bach_implied_vol_payer":
+            return {"vol": bachelier_implied_vol(
+                inp["price"], inp["forward"], inp["strike"], inp["expiry"], inp["annuity"], True)}
+        return {"price": bachelier_price(
+            inp["forward"], inp["strike"], inp["expiry"], inp["vol"], inp["annuity"], True)}
+    if name == "hw_calib_recover":
+        curve = _curve_from_inputs(inp)
+        caps = []
+        i = 1
+        while f"cap_price_{i}" in inp:
+            caps.append(CapletQuote(inp[f"cap_reset_{i}"], inp[f"cap_pay_{i}"], inp["strike"],
+                                    inp[f"cap_price_{i}"]))
+            i += 1
+        e = inp["swpt_expiry"]
+        pays = tuple(e + k for k in range(1, int(round(inp["swpt_tenor_years"])) + 1))
+        swps = [SwaptionQuote(e, pays, inp["swpt_fixed_rate"], inp["swpt_price"])]
+        cal = calibrate_hullwhite(curve, caps, swps)
+        assert cal.converged and cal.identified and not cal.at_bound
+        return {"a": cal.a, "sigma": cal.sigma}
     if name.startswith("hw_"):
         hw = _hw_from_inputs(inp)
         if name == "hw_zcb_t0":
             return {"price": hw.zcb_price(0.0, inp["T"])}
+        if name == "hw_zcb_t1_explicit_r":
+            return {"price": hw.zcb_price(inp["t"], inp["T"], inp["r"])}
         if name in ("hw_caplet", "hw_caplet_sigma0"):
             return {"price": hw.caplet(inp["reset"], inp["pay"], inp["strike"], inp["notional"])}
         if name == "hw_floorlet":
             return {"price": hw.floorlet(inp["reset"], inp["pay"], inp["strike"], inp["notional"])}
         if name == "hw_cap_3y":
-            sched = [inp["t0"], inp["t1"], inp["t2"], inp["t3"]]
+            sched = [inp["s0"], inp["s1"], inp["s2"], inp["s3"]]
             return {"price": hw.cap(sched, inp["strike"], inp["notional"])}
-        if name in ("hw_swaption_payer", "hw_swaption_neg_curve"):
+        if name in ("hw_swaption_payer", "hw_swaption_neg_curve", "hw_swaption_receiver"):
             expiry = inp["expiry"]
             n = int(round(inp["tenor_years"]))
             pay_times = [expiry + i for i in range(1, n + 1)]
-            res = hw.jamshidian_swaption(expiry, pay_times, inp["fixed_rate"], inp["notional"])
-            return {"price": res.value}
+            res = hw.jamshidian_swaption(expiry, pay_times, inp["fixed_rate"], inp["notional"],
+                                         payer=(name != "hw_swaption_receiver"))
+            out = {"price": res.value, "r_star": res.r_star}
+            for i, k in enumerate(res.strikes, start=1):
+                out[f"strike_{i}"] = k
+            return out
         if name == "hw_mc_caplet":
             price, _ = hw.mc_caplet(
                 inp["reset"], inp["pay"], inp["strike"], inp["notional"],
@@ -126,6 +169,6 @@ def test_golden_case(case: dict) -> None:
 
 
 def test_golden_has_expected_case_count() -> None:
-    assert len(CASES) >= 20
+    assert len(CASES) == 33
     names = [c["name"] for c in CASES]
     assert len(names) == len(set(names)), "duplicate golden case names"

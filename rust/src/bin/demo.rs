@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use irm::{
-    bootstrap, calibrate_vasicek, load_curve_quotes, load_ois_quotes, load_zero_yields,
-    par_swap_rate, DiscountCurve, HullWhite, IrmError,
+    bachelier_implied_vol, bootstrap, calibrate_hullwhite, calibrate_vasicek, load_curve_quotes,
+    load_ois_quotes, load_zero_yields, par_swap_rate, CapletQuote, DiscountCurve, HullWhite,
+    IrmError, SwaptionQuote,
 };
 
 fn data_dir() -> PathBuf {
@@ -56,11 +57,21 @@ fn run() -> Result<(), IrmError> {
 
     // ---- 2. Vasicek calibration -------------------------------------- //
     let (ts, ys) = load_zero_yields(&data.join("zero_yields.csv"))?;
-    let cal = calibrate_vasicek(&ts, &ys, 0.03, None, 4000)?;
-    println!("\nVasicek calibration to data/zero_yields.csv (r0 = 3%):");
+    let cal = calibrate_vasicek(&ts, &ys, 0.03, None, 4000, None)?;
+    println!("\nVasicek calibration to data/zero_yields.csv (r0 = 3%), 3 starts:");
     println!(
-        "  kappa={:.4}  theta={:.4}  sigma={:.4}  rmse={:.2e}  iters={}  converged={}",
-        cal.kappa, cal.theta, cal.sigma, cal.rmse, cal.iterations, cal.converged
+        "  kappa={:.4}  theta={:.4}  sigma={:.4}  rmse={:.2e}  converged={}  at_bound={}",
+        cal.kappa, cal.theta, cal.sigma, cal.rmse, cal.converged, cal.at_bound
+    );
+    println!(
+        "  identified={}  spreads across equivalent starts: kappa {:.3}, theta {:.4}, sigma {:.4}",
+        cal.identified, cal.kappa_spread, cal.theta_spread, cal.sigma_spread
+    );
+    let cal = calibrate_vasicek(&ts, &ys, 0.03, None, 4000, Some(0.02))?;
+    println!("  with sigma fixed at 0.02 (from option prices):");
+    println!(
+        "  kappa={:.4}  theta={:.4}  rmse={:.2e}  converged={}  identified={}",
+        cal.kappa, cal.theta, cal.rmse, cal.converged, cal.identified
     );
     let model = cal.model()?;
     println!("  {:>4} {:>11} {:>9}", "T", "mkt yield %", "model %");
@@ -123,6 +134,47 @@ fn run() -> Result<(), IrmError> {
         eur_res.value,
         eur_res.r_star
     );
+
+    // ---- 5. Hull-White calibration + Bachelier vols ------------------ //
+    println!("\nHull-White calibration to USD caplet/swaption prices (a, sigma free):");
+    let truth = HullWhite::new(0.08, 0.012, usd.clone())?;
+    let mut caplets = Vec::new();
+    for r in [1.0, 2.0, 4.0] {
+        caplets.push(CapletQuote::new(r, r + 1.0, atm, truth.caplet(r, r + 1.0, atm, 1.0)?)?);
+    }
+    let swaptions = [SwaptionQuote::new(
+        expiry,
+        &pay_times,
+        fwd_par,
+        truth
+            .jamshidian_swaption(expiry, &pay_times, fwd_par, 1.0, true)?
+            .value,
+    )?];
+    let hcal = calibrate_hullwhite(&usd, &caplets, &swaptions, None, None, 4000)?;
+    println!(
+        "  a={:.6}  sigma={:.6}  rmse={:.1e}  converged={}  identified={}  (true: 0.08, 0.012)",
+        hcal.a, hcal.sigma, hcal.rmse, hcal.converged, hcal.identified
+    );
+    println!("  normal (bp) implied vols of the calibrated model:");
+    for q in &caplets {
+        let fwd = usd.fwd_rate(q.reset, q.pay)?;
+        let ann = (q.pay - q.reset) * usd.df(q.pay)?;
+        let vol = bachelier_implied_vol(q.price, fwd, q.strike, q.reset, ann, true)?;
+        println!(
+            "    caplet {:.0}y->{:.0}y  {:6.1} bp",
+            q.reset,
+            q.pay,
+            1e4 * vol
+        );
+    }
+    let mut ann = 0.0;
+    let mut prev = expiry;
+    for &t in &pay_times {
+        ann += (t - prev) * usd.df(t)?;
+        prev = t;
+    }
+    let svol = bachelier_implied_vol(swaptions[0].price, fwd_par, fwd_par, expiry, ann, true)?;
+    println!("    1y-into-5y swaption   {:6.1} bp", 1e4 * svol);
 
     println!("\ndone.");
     Ok(())

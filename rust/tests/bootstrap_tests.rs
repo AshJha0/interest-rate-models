@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use irm::{
-    bootstrap, load_curve_quotes, load_ois_quotes, par_swap_rate, DiscountCurve, Instrument,
-    IrmError,
+    annual_schedule, bootstrap, load_curve_quotes, load_ois_quotes, par_swap_rate,
+    solve_pillar_df, DiscountCurve, Instrument, IrmError, MAX_MATURITY, MIN_MATURITY,
 };
 
 fn data_dir() -> PathBuf {
@@ -128,9 +128,90 @@ fn crossed_quotes_produce_bootstrap_error() {
     match bootstrap(&ins) {
         Err(IrmError::Bootstrap(msg)) => {
             assert!(msg.contains("t=2"), "message should name the pillar: {msg}");
+            assert!(msg.contains("crossed"));
         }
         other => panic!("expected Bootstrap error, got {other:?}"),
     }
+}
+
+#[test]
+fn non_convergence_message_not_crossed_quotes() {
+    // A solver failure that is not a bracketing failure must not be
+    // relabelled as crossed quotes (MINOR-10).
+    match solve_pillar_df(|x| Ok(if x > 1.0 { f64::INFINITY } else { -1.0 }), 2.0, "test") {
+        Err(IrmError::Bootstrap(msg)) => {
+            assert!(msg.contains("solver failed") && msg.contains("not finite"), "{msg}");
+            assert!(!msg.contains("crossed"));
+        }
+        other => panic!("expected Bootstrap error, got {other:?}"),
+    }
+    match solve_pillar_df(|x| Ok(1.0 + x), 2.0, "test") {
+        Err(IrmError::Bootstrap(msg)) => assert!(msg.contains("crossed")),
+        other => panic!("expected Bootstrap error, got {other:?}"),
+    }
+    let df = solve_pillar_df(|x| Ok(x - 0.9), 2.0, "test").unwrap();
+    assert!((df - 0.9).abs() < 1e-13);
+}
+
+#[test]
+fn swap_maturity_out_of_range_rejected() {
+    // 1e12 used to panic with a Vec capacity overflow; now Err, never panic.
+    for bad in [1e12, 1e9, MAX_MATURITY * (1.0 + 1e-9), 1e-13, MIN_MATURITY / 2.0, f64::INFINITY] {
+        assert!(Instrument::swap(bad, 0.03).is_err(), "{bad}");
+        assert!(Instrument::ois_swap(bad, 0.03).is_err(), "{bad}");
+        assert!(Instrument::deposit(bad, 0.03).is_err(), "{bad}");
+        assert!(Instrument::fra(0.0, bad, 0.03).is_err(), "{bad}");
+        assert!(annual_schedule(bad).is_err(), "{bad}");
+    }
+    assert_eq!(annual_schedule(MAX_MATURITY).unwrap().len(), 200);
+    assert_eq!(annual_schedule(MIN_MATURITY).unwrap(), vec![MIN_MATURITY]);
+    assert_eq!(annual_schedule(199.5).unwrap().len(), 200);
+}
+
+#[test]
+fn fra_strip_reprices() {
+    let ins = vec![
+        Instrument::deposit(0.5, 0.030).unwrap(),
+        Instrument::fra(0.5, 1.0, 0.032).unwrap(),
+        Instrument::fra(1.0, 1.5, 0.034).unwrap(),
+        Instrument::swap(3.0, 0.033).unwrap(),
+    ];
+    let curve = bootstrap(&ins).unwrap();
+    reprice_all(&ins, &curve);
+    assert!((curve.fwd_rate(0.5, 1.0).unwrap() - 0.032).abs() < 1e-12);
+}
+
+#[test]
+fn ois_sub_year_maturity() {
+    let c = bootstrap(&[Instrument::ois_swap(1.0 / 12.0, 0.03).unwrap()]).unwrap();
+    assert!((c.df(1.0 / 12.0).unwrap() - 1.0 / (1.0 + 0.03 / 12.0)).abs() < 1e-12);
+}
+
+#[test]
+fn dv01_localises_in_quote_space() {
+    let quotes = usd_instruments();
+    let times: Vec<f64> = (0..=10).map(f64::from).collect();
+    let bumped = |pillar: f64| -> DiscountCurve {
+        let out: Vec<Instrument> = quotes
+            .iter()
+            .map(|q| {
+                let bump = if q.pillar() == pillar { 1e-4 } else { 0.0 };
+                match *q {
+                    Instrument::Deposit { maturity, rate } => {
+                        Instrument::deposit(maturity, rate + bump).unwrap()
+                    }
+                    Instrument::Swap { maturity, rate } => {
+                        Instrument::swap(maturity, rate + bump).unwrap()
+                    }
+                    other => other,
+                }
+            })
+            .collect();
+        bootstrap(&out).unwrap()
+    };
+    assert!((par_swap_rate(&bootstrap(&quotes).unwrap(), &times).unwrap() - 0.0425).abs() < 1e-12);
+    assert!((par_swap_rate(&bumped(5.0), &times).unwrap() - 0.0425).abs() < 1e-12);
+    assert!((par_swap_rate(&bumped(10.0), &times).unwrap() - 0.0425 - 1e-4).abs() < 1e-12);
 }
 
 #[test]

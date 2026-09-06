@@ -134,3 +134,10 @@ fn inst_forward_uses_right_segment_at_pillar() {
     // At t = 2.0 exactly, the right-hand segment [2, 3] applies.
     assert!((c.inst_forward(2.0).unwrap() - f_23).abs() < 1e-15);
 }
+
+#[test]
+fn fwd_rate_underflow_is_standard_error() {
+    let c = DiscountCurve::new(&[1.0], &[0.95]).unwrap();
+    assert!(matches!(c.fwd_rate(0.0, 1e6), Err(IrmError::InvalidInput(_)))); // DF underflows
+    assert!(c.fwd_rate(0.0, 500.0).unwrap().is_finite());
+}

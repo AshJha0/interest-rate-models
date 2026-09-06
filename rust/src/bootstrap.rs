@@ -23,10 +23,13 @@
 //!   with `annuity = sum_i tau_i DF(t_i)` over the annual fixed schedule.
 //!
 //! The root is found with the native Brent solver on the bracket
-//! `DF in [1e-10, 100]` with `xtol = 1e-14`.  A bracket failure means no
-//! positive discount factor can reprice the quote — i.e. crossed or
+//! `DF in [1e-10, 100]` with `xtol = 1e-14`.  A *bracketing* failure means
+//! no positive discount factor can reprice the quote — i.e. crossed or
 //! arbitrageable quotes (the "negative implied DF" case) — and yields
-//! `IrmError::Bootstrap`.
+//! `IrmError::Bootstrap` saying so; any other solver failure (non-finite
+//! residual, iteration budget) is reported as a solver failure at that
+//! pillar, never relabelled as crossed quotes.  Maturities are bounded to
+//! `[MIN_MATURITY, MAX_MATURITY] = [1e-6, 200]` years at construction.
 
 use crate::curve::DiscountCurve;
 use crate::error::{IrmError, Result};
@@ -34,6 +37,23 @@ use crate::rootfind::{brentq, BRENT_MAXITER, BRENT_RTOL};
 
 const DF_LO: f64 = 1e-10;
 const DF_HI: f64 = 100.0;
+
+/// Smallest instrument maturity / FRA end accepted (years).  Guarantees the
+/// annual schedule has at least one payment.
+pub const MIN_MATURITY: f64 = 1e-6;
+/// Largest instrument maturity accepted (years).  Bounds the schedule length
+/// (at most 200 payments) so a maturity typed in days cannot panic with a
+/// capacity overflow.
+pub const MAX_MATURITY: f64 = 200.0;
+
+fn check_maturity(what: &str, maturity: f64) -> Result<()> {
+    if !maturity.is_finite() || !(MIN_MATURITY..=MAX_MATURITY).contains(&maturity) {
+        return Err(IrmError::InvalidInput(format!(
+            "{what} must be finite and within [{MIN_MATURITY}, {MAX_MATURITY}] years, got {maturity}"
+        )));
+    }
+    Ok(())
+}
 
 fn check_rate(rate: f64) -> Result<()> {
     if !rate.is_finite() {
@@ -46,15 +66,14 @@ fn check_rate(rate: f64) -> Result<()> {
 
 /// Annual fixed-leg payment times ending exactly at `maturity`.
 ///
-/// `n = ceil(maturity)` payments at `maturity - (n-1), ..., maturity`;
+/// `n = ceil(maturity - 1e-12)` payments at `maturity - (n-1), ..., maturity`;
 /// e.g. `2.0 -> [1.0, 2.0]`; `2.5 -> [0.5, 1.5, 2.5]`; `0.25 -> [0.25]`.
 /// A short first stub (< 1y) is created for non-integer maturities.
+/// `maturity` must lie in `[MIN_MATURITY, MAX_MATURITY]` (`[1e-6, 200]`
+/// years), so `1 <= n <= 200` always.
 pub fn annual_schedule(maturity: f64) -> Result<Vec<f64>> {
-    if !maturity.is_finite() || maturity <= 0.0 {
-        return Err(IrmError::InvalidInput(format!(
-            "maturity must be finite and > 0, got {maturity}"
-        )));
-    }
+    check_maturity("maturity", maturity)?;
+    // maturity <= 200 here, so the cast is exact and the Vec is small.
     let n = (maturity - 1e-12).ceil() as usize;
     Ok((0..n).map(|k| maturity - (n - 1 - k) as f64).collect())
 }
@@ -100,11 +119,7 @@ impl Instrument {
     /// Validated deposit; requires `T > 0` and `1 + R*T > 0`.
     pub fn deposit(maturity: f64, rate: f64) -> Result<Self> {
         check_rate(rate)?;
-        if !maturity.is_finite() || maturity <= 0.0 {
-            return Err(IrmError::InvalidInput(format!(
-                "deposit maturity must be > 0, got {maturity}"
-            )));
-        }
+        check_maturity("deposit maturity", maturity)?;
         if 1.0 + rate * maturity <= 0.0 {
             return Err(IrmError::InvalidInput(format!(
                 "deposit quote implies non-positive discount factor \
@@ -121,6 +136,7 @@ impl Instrument {
         if !start.is_finite() || !end.is_finite() {
             return Err(IrmError::InvalidInput("FRA times must be finite".into()));
         }
+        check_maturity("FRA end", end)?;
         if start < 0.0 || end <= start {
             return Err(IrmError::InvalidInput(format!(
                 "FRA needs 0 <= start < end, got start={start}, end={end}"
@@ -194,13 +210,41 @@ impl Instrument {
     }
 }
 
+/// Solve `residual(DF) = 0` for one pillar on the bracket `[1e-10, 100]`
+/// (`xtol = 1e-14`).  This is the per-pillar kernel of [`bootstrap`],
+/// exposed so the error classification can be tested directly:
+///
+/// * no sign change on the bracket -> `IrmError::Bootstrap` "no admissible
+///   positive discount factor — crossed/arbitrageable quotes";
+/// * any other solver failure (non-finite residual, iteration budget) ->
+///   `IrmError::Bootstrap` "solver failed at pillar" carrying the message.
+pub fn solve_pillar_df<F>(residual: F, pillar: f64, label: &str) -> Result<f64>
+where
+    F: FnMut(f64) -> Result<f64>,
+{
+    brentq(residual, DF_LO, DF_HI, 1e-14, BRENT_RTOL, BRENT_MAXITER).map_err(|exc| {
+        let msg = exc.to_string();
+        if msg.contains("not bracketed") {
+            IrmError::Bootstrap(format!(
+                "bootstrap failed at pillar t={pillar} ({label}): no admissible positive \
+                 discount factor in [{DF_LO}, {DF_HI}] — crossed/arbitrageable quotes? [{msg}]"
+            ))
+        } else {
+            IrmError::Bootstrap(format!(
+                "bootstrap: solver failed at pillar t={pillar} ({label}): {msg}"
+            ))
+        }
+    })
+}
+
 /// Sequentially bootstrap a discount curve from sorted instruments.
 ///
 /// Instruments must be ordered with strictly increasing pillar times
 /// (duplicates rejected).  Each pillar DF is solved with Brent's method on
-/// `[1e-10, 100]` (DF > 1 allowed: negative rates).  Returns
-/// `IrmError::Bootstrap` when no positive DF can reprice a quote
-/// (crossed/arbitrageable inputs).
+/// `[1e-10, 100]` (DF > 1 allowed: negative rates) via [`solve_pillar_df`].
+/// Returns `IrmError::Bootstrap` when no positive DF can reprice a quote
+/// (crossed/arbitrageable inputs, message says so) or when the solver
+/// fails for any other reason (message says "solver failed").
 pub fn bootstrap(instruments: &[Instrument]) -> Result<DiscountCurve> {
     if instruments.is_empty() {
         return Err(IrmError::InvalidInput(
@@ -231,16 +275,11 @@ pub fn bootstrap(instruments: &[Instrument]) -> Result<DiscountCurve> {
             let trial = DiscountCurve::new(&trial_t, &trial_df)?;
             ins.residual(&trial)
         };
-        let df = brentq(objective, DF_LO, DF_HI, 1e-14, BRENT_RTOL, BRENT_MAXITER)
-            .map_err(|exc| {
-                IrmError::Bootstrap(format!(
-                    "bootstrap failed at pillar t={pillar} ({}, rate={}): no \
-                     admissible positive discount factor — \
-                     crossed/arbitrageable quotes? [{exc}]",
-                    ins.kind(),
-                    ins.rate()
-                ))
-            })?;
+        let df = solve_pillar_df(
+            objective,
+            pillar,
+            &format!("{}, rate={}", ins.kind(), ins.rate()),
+        )?;
         times.push(pillar);
         dfs.push(df);
     }

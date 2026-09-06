@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Build the irm Java library, demo and tests into out/.
+# Override the JUnit 4 / Hamcrest jar locations with the JUNIT / HAMCREST
+# environment variables if they are not at the Debian/Ubuntu default paths.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-JUNIT=/usr/share/java/junit4.jar
-HAMCREST=/usr/share/java/hamcrest.jar
+JUNIT=${JUNIT:-/usr/share/java/junit4.jar}
+HAMCREST=${HAMCREST:-/usr/share/java/hamcrest.jar}
 
 rm -rf out
 mkdir -p out/main out/test
