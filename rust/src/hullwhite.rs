@@ -27,6 +27,11 @@
 //! swaptions.  Monte Carlo simulates `r(t) = x(t) + alpha(t)` with exact
 //! Gaussian OU moments (trinomial-tree-free),
 //! `alpha(t) = f^M(0,t) + (sigma^2/(2a^2)) (1 - e^{-a t})^2`.
+//!
+//! Calibration: [`calibrate_hullwhite`] fits `(a, sigma)` (or sigma with
+//! `a` fixed) to caplet / payer-swaption prices by least squares from
+//! several Nelder-Mead starts; [`crate::bachelier`] converts prices to
+//! normal (bp) implied volatilities.
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -34,11 +39,44 @@ use rand_distr::StandardNormal;
 
 use crate::curve::{par_swap_rate, DiscountCurve};
 use crate::error::{IrmError, Result};
-use crate::mathutils::{norm_cdf, ou_step_moments};
+use crate::mathutils::{norm_cdf, ou_integral_variance, ou_step_moments};
+use crate::optimize::nelder_mead;
 use crate::rootfind::{brentq, BRENT_MAXITER, BRENT_RTOL};
 
 /// Finite-difference step for the market instantaneous forward `f(0,t)`.
 pub const FD_STEP: f64 = 1e-5;
+/// The coupon-bond residual `|g(r*)|` must be below this after the root find.
+pub const JAMSHIDIAN_RESIDUAL_TOL: f64 = 1e-10;
+/// Maximum bracket doublings when searching for r*.
+const JAMSHIDIAN_MAX_DOUBLINGS: usize = 24;
+/// Largest exponent passed to exp() before a ZCB price is declared not
+/// representable (exp(709.78) is the double overflow point).
+const MAX_EXP_ARG: f64 = 700.0;
+
+/// Calibration domain `(a_lo, a_hi, sigma_hi)` (sigma_lo = 0); outside gets
+/// the penalty `1e6 (1 + distance)`.
+pub const HW_DOMAIN: (f64, f64, f64) = (1e-6, 5.0, 1.0);
+/// Default multi-start `(a, sigma)` pairs (sigma-only starts use the sigmas).
+pub const HW_CALIBRATION_STARTS: [(f64, f64); 3] = [(0.03, 0.005), (0.1, 0.01), (0.5, 0.02)];
+const A_LO_BOUND: f64 = 1e-5;
+const A_HI_BOUND: f64 = 4.995;
+const SIGMA_LO_BOUND: f64 = 1e-5;
+const SIGMA_HI_BOUND: f64 = 0.999;
+const EQUIV_RMSE_FACTOR: f64 = 1.05;
+const EQUIV_RMSE_FLOOR: f64 = 1e-14;
+const IDENT_A: f64 = 1e-2;
+const IDENT_SIGMA: f64 = 1e-4;
+/// sigma is optimised as sigma * SIGMA_SCALE so one Nelder-Mead step fits both.
+const SIGMA_SCALE: f64 = 10.0;
+
+fn check_finite(name: &str, v: f64) -> Result<()> {
+    if !v.is_finite() {
+        return Err(IrmError::InvalidInput(format!(
+            "{name} must be finite, got {v}"
+        )));
+    }
+    Ok(())
+}
 
 /// Jamshidian swaption decomposition output.
 #[derive(Debug, Clone, PartialEq)]
@@ -123,26 +161,37 @@ impl HullWhite {
     ///
     /// `theta(t) = df/dt + a f + (sigma^2/(2a)) (1 - e^{-2 a t})` with
     /// `df/dt` approximated by the forward difference
-    /// `(fwd0(t+h') - fwd0(t))/h'`, `h' = 1e-4`.
+    /// `(fwd0(t+h') - fwd0(t))/h'`, `h' = 1e-4` (see [`Self::theta_with_step`]).
     pub fn theta(&self, t: f64) -> Result<f64> {
-        let h = 1e-4;
+        self.theta_with_step(t, 1e-4)
+    }
+
+    /// [`Self::theta`] with an explicit forward-difference step `h > 0`.
+    pub fn theta_with_step(&self, t: f64, h: f64) -> Result<f64> {
+        if !h.is_finite() || h <= 0.0 {
+            return Err(IrmError::InvalidInput(format!(
+                "theta step h must be finite and > 0, got {h}"
+            )));
+        }
         let dfdt = (self.fwd0(t + h)? - self.fwd0(t)?) / h;
         Ok(dfdt
             + self.a * self.fwd0(t)?
             + (self.sigma * self.sigma / (2.0 * self.a))
-                * (1.0 - (-2.0 * self.a * t).exp()))
+                * (-(-2.0 * self.a * t).exp_m1()))
     }
 
     // ----------------------- affine ZCB ------------------------------- //
 
-    /// `B(t,T) = (1 - e^{-a (T-t)}) / a`.
+    /// `B(t,T) = (1 - e^{-a (T-t)}) / a` (`exp_m1` form), `0 <= t <= T` finite.
     pub fn b_factor(&self, t: f64, maturity: f64) -> Result<f64> {
-        if maturity < t {
+        check_finite("t", t)?;
+        check_finite("maturity", maturity)?;
+        if t < 0.0 || maturity < t {
             return Err(IrmError::InvalidInput(format!(
-                "maturity {maturity} before t {t}"
+                "need 0 <= t <= maturity, got t={t}, maturity={maturity}"
             )));
         }
-        Ok((1.0 - (-self.a * (maturity - t)).exp()) / self.a)
+        Ok(-(-self.a * (maturity - t)).exp_m1() / self.a)
     }
 
     /// `A(t,T)` built from market DFs and `f^M(0,t)` (see module docs).
@@ -151,7 +200,7 @@ impl HullWhite {
         let pm_t = self.curve.df(t)?;
         let pm_mat = self.curve.df(maturity)?;
         let conv = self.sigma * self.sigma / (4.0 * self.a)
-            * (1.0 - (-2.0 * self.a * t).exp())
+            * (-(-2.0 * self.a * t).exp_m1())
             * b
             * b;
         Ok((pm_mat / pm_t) * (b * self.fwd0(t)? - conv).exp())
@@ -161,6 +210,7 @@ impl HullWhite {
     ///
     /// `r = None` defaults to `r(0) = f^M(0,0)` (so `P(0,T)` equals the
     /// market DF exactly: the `e^{B f}` and `e^{-B r}` terms cancel).
+    /// Errors when `exp(-B r)` would overflow (result not representable).
     pub fn zcb_price(&self, t: f64, maturity: f64, r: Option<f64>) -> Result<f64> {
         let rr = match r {
             Some(v) => {
@@ -173,7 +223,13 @@ impl HullWhite {
             }
             None => self.fwd0(0.0)?,
         };
-        Ok(self.a_factor(t, maturity)? * (-self.b_factor(t, maturity)? * rr).exp())
+        let expo = -self.b_factor(t, maturity)? * rr;
+        if expo > MAX_EXP_ARG {
+            return Err(IrmError::InvalidInput(format!(
+                "ZCB price not representable: exp({expo}) overflows"
+            )));
+        }
+        Ok(self.a_factor(t, maturity)? * expo.exp())
     }
 
     // ----------------------- ZCB options ------------------------------ //
@@ -182,7 +238,7 @@ impl HullWhite {
     /// `sigma_p = sigma sqrt((1 - e^{-2 a T})/(2a)) B(T,S)`.
     fn sigma_p(&self, expiry: f64, bond_maturity: f64) -> Result<f64> {
         Ok(self.sigma
-            * ((1.0 - (-2.0 * self.a * expiry).exp()) / (2.0 * self.a)).sqrt()
+            * ((-(-2.0 * self.a * expiry).exp_m1()) / (2.0 * self.a)).sqrt()
             * self.b_factor(expiry, bond_maturity)?)
     }
 
@@ -230,6 +286,32 @@ impl HullWhite {
 
     // ----------------------- caplets / caps --------------------------- //
 
+    /// Validate caplet-style inputs and return `tau`.
+    fn check_caplet_inputs(
+        what: &str,
+        reset: f64,
+        pay: f64,
+        strike: f64,
+        notional: f64,
+    ) -> Result<f64> {
+        check_finite("reset", reset)?;
+        check_finite("pay", pay)?;
+        check_finite("strike", strike)?;
+        check_finite("notional", notional)?;
+        let tau = pay - reset;
+        if tau <= 0.0 || reset < 0.0 {
+            return Err(IrmError::InvalidInput(format!(
+                "{what}: need 0 <= reset < pay, got {reset}, {pay}"
+            )));
+        }
+        if 1.0 + strike * tau <= 0.0 {
+            return Err(IrmError::InvalidInput(format!(
+                "{what}: strike implies non-positive 1 + K*tau ({strike})"
+            )));
+        }
+        Ok(tau)
+    }
+
     /// Caplet on the simple forward over `[reset, pay]`.
     ///
     /// Pays `notional * tau * max(F(reset,pay) - K, 0)` at `pay`.  A caplet
@@ -238,50 +320,43 @@ impl HullWhite {
     /// `caplet = notional (1 + K tau) ZBP(reset, pay, 1/(1 + K tau))`.
     ///
     /// With `sigma = 0` this degenerates to discounted intrinsic on the
-    /// forward, `notional * DF(pay) * tau * max(F - K, 0)`.
+    /// forward, `notional * DF(pay) * tau * max(F - K, 0)`.  All inputs must
+    /// be finite (`notional` may be negative: a short position).
     pub fn caplet(&self, reset: f64, pay: f64, strike: f64, notional: f64) -> Result<f64> {
-        let tau = pay - reset;
-        if tau <= 0.0 || reset < 0.0 {
-            return Err(IrmError::InvalidInput(format!(
-                "need 0 <= reset < pay, got {reset}, {pay}"
-            )));
-        }
-        if !strike.is_finite() || 1.0 + strike * tau <= 0.0 {
-            return Err(IrmError::InvalidInput(format!(
-                "caplet strike implies non-positive 1 + K*tau ({strike})"
-            )));
-        }
+        let tau = Self::check_caplet_inputs("caplet", reset, pay, strike, notional)?;
         let k_bond = 1.0 / (1.0 + strike * tau);
         Ok(notional * (1.0 + strike * tau) * self.zbp(reset, pay, k_bond)?)
     }
 
     /// Floorlet: `notional (1 + K tau) ZBC(reset, pay, 1/(1 + K tau))`.
     pub fn floorlet(&self, reset: f64, pay: f64, strike: f64, notional: f64) -> Result<f64> {
-        let tau = pay - reset;
-        if tau <= 0.0 || reset < 0.0 {
-            return Err(IrmError::InvalidInput(format!(
-                "need 0 <= reset < pay, got {reset}, {pay}"
-            )));
-        }
-        if !strike.is_finite() || 1.0 + strike * tau <= 0.0 {
-            return Err(IrmError::InvalidInput(format!(
-                "floorlet strike implies non-positive 1 + K*tau ({strike})"
-            )));
-        }
+        let tau = Self::check_caplet_inputs("floorlet", reset, pay, strike, notional)?;
         let k_bond = 1.0 / (1.0 + strike * tau);
         Ok(notional * (1.0 + strike * tau) * self.zbc(reset, pay, k_bond)?)
     }
 
     /// Cap = strip of caplets over consecutive schedule times.
     ///
-    /// `schedule = [t0, t1, ..., tn]` prices caplets on
-    /// `[t0,t1], ..., [t_{n-1}, t_n]` (first reset `t0 >= 0`).
+    /// `schedule = [t0, t1, ..., tn]` (>= 2 finite, strictly increasing
+    /// times, `t0 >= 0`) prices caplets on `[t0,t1], ..., [t_{n-1}, t_n]`.
     pub fn cap(&self, schedule: &[f64], strike: f64, notional: f64) -> Result<f64> {
         if schedule.len() < 2 {
             return Err(IrmError::InvalidInput(
                 "cap schedule needs at least two times".into(),
             ));
         }
+        if schedule.iter().any(|t| !t.is_finite()) {
+            return Err(IrmError::InvalidInput(
+                "cap schedule times must be finite".into(),
+            ));
+        }
+        if schedule[0] < 0.0 || schedule.windows(2).any(|w| w[1] <= w[0]) {
+            return Err(IrmError::InvalidInput(
+                "cap schedule must be strictly increasing with t0 >= 0".into(),
+            ));
+        }
+        check_finite("strike", strike)?;
+        check_finite("notional", notional)?;
         let mut total = 0.0;
         for w in schedule.windows(2) {
             total += self.caplet(w[0], w[1], strike, notional)?;
@@ -296,6 +371,112 @@ impl HullWhite {
 
     // ----------------------- Jamshidian swaption ---------------------- //
 
+    /// Validate a swaption schedule and return `(pay_times, coupons)`.
+    fn swaption_coupons(
+        expiry: f64,
+        pay_times: &[f64],
+        fixed_rate: f64,
+        notional: f64,
+    ) -> Result<Vec<f64>> {
+        if !expiry.is_finite() || expiry <= 0.0 {
+            return Err(IrmError::InvalidInput(format!(
+                "swaption expiry must be finite and > 0, got {expiry}"
+            )));
+        }
+        if pay_times.is_empty() {
+            return Err(IrmError::InvalidInput(
+                "swaption needs at least one payment time".into(),
+            ));
+        }
+        check_finite("fixed_rate", fixed_rate)?;
+        check_finite("notional", notional)?;
+        let mut prev = expiry;
+        let mut coupons = Vec::with_capacity(pay_times.len());
+        for &t in pay_times {
+            if !t.is_finite() || t <= prev {
+                return Err(IrmError::InvalidInput(
+                    "payment times must be finite, strictly increasing and after expiry".into(),
+                ));
+            }
+            coupons.push(fixed_rate * (t - prev));
+            prev = t;
+        }
+        let last = coupons.len() - 1;
+        coupons[last] += 1.0;
+        if coupons[last] <= 0.0 {
+            return Err(IrmError::InvalidInput(format!(
+                "jamshidian: degenerate coupon bond — 1 + X*tau_n must be > 0 (got {}); \
+                 no r* exists",
+                coupons[last]
+            )));
+        }
+        Ok(coupons)
+    }
+
+    /// Jamshidian decomposition for a *given* critical rate `r*`.
+    ///
+    /// Enforces the contract of [`Self::jamshidian_swaption`] step 2: the
+    /// residual `g(r*) = sum_i c_i P(T,u_i;r*) - 1` must satisfy
+    /// `|g(r*)| < 1e-10` and the slope `g'(r*) = -sum_i c_i B_i K_i` must be
+    /// negative (the crossing is on the decreasing branch of `g`);
+    /// otherwise `IrmError::RootFind`.  Exposed so the contract is testable
+    /// and so payer/receiver can share one root find.
+    pub fn jamshidian_at_r_star(
+        &self,
+        expiry: f64,
+        pay_times: &[f64],
+        fixed_rate: f64,
+        r_star: f64,
+        notional: f64,
+        payer: bool,
+    ) -> Result<JamshidianResult> {
+        let coupons = Self::swaption_coupons(expiry, pay_times, fixed_rate, notional)?;
+        if !r_star.is_finite() {
+            return Err(IrmError::InvalidInput(format!(
+                "jamshidian: r* must be finite, got {r_star}"
+            )));
+        }
+        let mut strikes = Vec::with_capacity(pay_times.len());
+        for &t in pay_times {
+            strikes.push(self.zcb_price(expiry, t, Some(r_star))?);
+        }
+        let residual = coupons
+            .iter()
+            .zip(strikes.iter())
+            .map(|(c, k)| c * k)
+            .sum::<f64>()
+            - 1.0;
+        if !(residual.abs() < JAMSHIDIAN_RESIDUAL_TOL) {
+            return Err(IrmError::RootFind(format!(
+                "jamshidian: r* residual {residual} exceeds {JAMSHIDIAN_RESIDUAL_TOL}"
+            )));
+        }
+        let mut slope = 0.0;
+        for ((c, &t), &k) in coupons.iter().zip(pay_times.iter()).zip(strikes.iter()) {
+            slope -= c * self.b_factor(expiry, t)? * k;
+        }
+        if !(slope < 0.0) {
+            return Err(IrmError::RootFind(format!(
+                "jamshidian: coupon bond not decreasing at r* (slope {slope}); \
+                 decomposition invalid"
+            )));
+        }
+        let mut value = 0.0;
+        for ((c, &t), &k) in coupons.iter().zip(pay_times.iter()).zip(strikes.iter()) {
+            value += c * if payer {
+                self.zbp(expiry, t, k)?
+            } else {
+                self.zbc(expiry, t, k)?
+            };
+        }
+        Ok(JamshidianResult {
+            value: notional * value,
+            r_star,
+            residual,
+            strikes,
+        })
+    }
+
     /// European swaption via Jamshidian's decomposition.
     ///
     /// The underlying swap exchanges the fixed rate for the (single-curve)
@@ -303,12 +484,23 @@ impl HullWhite {
     /// `tau_1 = t_1 - expiry`, `tau_i = t_i - t_{i-1}`.  A payer swaption's
     /// payoff at expiry is `max(1 - sum_i c_i P(T, t_i), 0)` with coupons
     /// `c_i = X tau_i` and `c_n = 1 + X tau_n` — a put with strike 1 on a
-    /// coupon bond.
+    /// coupon bond `g(r) = sum_i c_i P(T, t_i; r)`.
     ///
-    /// Because `P(T, t; r)` is strictly decreasing in `r` (`B > 0`), the
-    /// coupon bond price is monotone in `r`, so there is a unique `r*` with
-    /// `sum_i c_i P(T, t_i; r*) = 1` (found with the native Brent solver on
-    /// an expanding bracket).  Setting `K_i = P(T, t_i; r*)`, the
+    /// Exactness needs `g(r) - 1` to change sign exactly once.  For `X >= 0`
+    /// every coupon is positive and `g` is strictly decreasing (each
+    /// `B > 0`).  For `X < 0` the coupon signs are `(-, ..., -, +)` when
+    /// `1 + X tau_n > 0`: `g'` is an exponential sum with one sign change,
+    /// so `g` has a single minimum, tends to `+inf` as `r -> -inf` and to
+    /// `0^-` as `r -> +inf`, and still crosses 1 exactly once — the
+    /// decomposition remains exact (verified against direct integration in
+    /// the tests).  If `1 + X tau_n <= 0` every coupon is non-positive and
+    /// no `r*` exists (`InvalidInput`, "degenerate").
+    ///
+    /// `r*` is found with the native Brent solver on an expanding bracket
+    /// (start `[-1, 1]`, double the failing side, at most 24 doublings,
+    /// never past the exp() overflow point), `xtol = 1e-15`; then
+    /// `|g(r*)| < 1e-10` and `g'(r*) < 0` are enforced by
+    /// [`Self::jamshidian_at_r_star`].  Setting `K_i = P(T, t_i; r*)`, the
     /// coupon-bond option splits *exactly* into ZCB options that are all
     /// exercised on the same event `{r_T > r*}`:
     ///
@@ -322,32 +514,7 @@ impl HullWhite {
         notional: f64,
         payer: bool,
     ) -> Result<JamshidianResult> {
-        if !expiry.is_finite() || expiry <= 0.0 {
-            return Err(IrmError::InvalidInput(format!(
-                "swaption expiry must be > 0, got {expiry}"
-            )));
-        }
-        if pay_times.is_empty() {
-            return Err(IrmError::InvalidInput(
-                "swaption needs at least one payment time".into(),
-            ));
-        }
-        if !fixed_rate.is_finite() {
-            return Err(IrmError::InvalidInput("fixed rate must be finite".into()));
-        }
-        let mut prev = expiry;
-        let mut taus = Vec::with_capacity(pay_times.len());
-        for &t in pay_times {
-            if t <= prev {
-                return Err(IrmError::InvalidInput(
-                    "payment times must be strictly increasing and after expiry".into(),
-                ));
-            }
-            taus.push(t - prev);
-            prev = t;
-        }
-        let mut coupons: Vec<f64> = taus.iter().map(|tau| fixed_rate * tau).collect();
-        *coupons.last_mut().expect("non-empty") += 1.0;
+        let coupons = Self::swaption_coupons(expiry, pay_times, fixed_rate, notional)?;
 
         let bond_minus_one = |r: f64| -> Result<f64> {
             let mut s = 0.0;
@@ -357,10 +524,15 @@ impl HullWhite {
             Ok(s - 1.0)
         };
 
-        // Expanding bracket: g is strictly decreasing in r.
+        // Expanding bracket: g(lo) > 0 > g(hi) is needed.  g(lo) grows like
+        // exp(B_n |lo|); refuse to evaluate past the exp() overflow point.
+        let b_last = self.b_factor(expiry, pay_times[pay_times.len() - 1])?;
         let (mut lo, mut hi) = (-1.0_f64, 1.0_f64);
         let mut bracketed = false;
-        for _ in 0..24 {
+        for _ in 0..JAMSHIDIAN_MAX_DOUBLINGS {
+            if b_last * (-lo) > MAX_EXP_ARG {
+                break;
+            }
             let g_lo = bond_minus_one(lo)?;
             let g_hi = bond_minus_one(hi)?;
             if g_lo > 0.0 && g_hi < 0.0 {
@@ -382,30 +554,7 @@ impl HullWhite {
             ));
         }
         let r_star = brentq(bond_minus_one, lo, hi, 1e-15, BRENT_RTOL, BRENT_MAXITER)?;
-        let residual = bond_minus_one(r_star)?;
-        if residual.abs() >= 1e-10 {
-            return Err(IrmError::RootFind(format!(
-                "jamshidian: r* residual {residual} exceeds 1e-10"
-            )));
-        }
-        let mut strikes = Vec::with_capacity(pay_times.len());
-        for &t in pay_times {
-            strikes.push(self.zcb_price(expiry, t, Some(r_star))?);
-        }
-        let mut value = 0.0;
-        for ((c, &t), &k) in coupons.iter().zip(pay_times.iter()).zip(strikes.iter()) {
-            value += c * if payer {
-                self.zbp(expiry, t, k)?
-            } else {
-                self.zbc(expiry, t, k)?
-            };
-        }
-        Ok(JamshidianResult {
-            value: notional * value,
-            r_star,
-            residual,
-            strikes,
-        })
+        self.jamshidian_at_r_star(expiry, pay_times, fixed_rate, r_star, notional, payer)
     }
 
     // ----------------------- Monte Carlo ------------------------------ //
@@ -413,7 +562,7 @@ impl HullWhite {
     /// Deterministic shift `alpha(t) = f^M(0,t)
     /// + (sigma^2/(2 a^2)) (1 - e^{-a t})^2` with `r(t) = x(t) + alpha(t)`.
     pub fn alpha(&self, t: f64) -> Result<f64> {
-        let one_me = 1.0 - (-self.a * t).exp();
+        let one_me = -(-self.a * t).exp_m1();
         Ok(self.fwd0(t)?
             + (self.sigma * self.sigma / (2.0 * self.a * self.a)) * one_me * one_me)
     }
@@ -421,11 +570,14 @@ impl HullWhite {
     /// `V(t) = int_0^t (sigma^2/(2a^2))(1 - e^{-a s})^2 ds` so that
     /// `int_0^t alpha ds = -ln P^M(0,t) + V(t)`; closed form:
     ///
-    /// `V(t) = (sigma^2/(2a^2)) [t - 2(1-e^{-a t})/a + (1-e^{-2 a t})/(2a)]`.
-    fn variance_integral(&self, t: f64) -> f64 {
-        let a = self.a;
-        (self.sigma * self.sigma / (2.0 * a * a))
-            * (t - 2.0 * (1.0 - (-a * t).exp()) / a + (1.0 - (-2.0 * a * t).exp()) / (2.0 * a))
+    /// `V(t) = (sigma^2/(2a^2)) [t - 2(1-e^{-a t})/a + (1-e^{-2 a t})/(2a)]`,
+    /// which is half the integrated-OU variance kernel
+    /// ([`ou_integral_variance`]), evaluated without cancellation.  `V(0) = 0`.
+    pub fn variance_integral(&self, t: f64) -> Result<f64> {
+        if t == 0.0 {
+            return Ok(0.0);
+        }
+        Ok(0.5 * ou_integral_variance(self.a, self.sigma, t)?)
     }
 
     /// Unbiased MC caplet price and standard error.
@@ -439,7 +591,8 @@ impl HullWhite {
     /// `r(T) = x(T) + alpha(T)`; the payoff (paid at `pay`, known at `T`)
     /// is valued as `D(0,T) P(T,pay) * notional * tau * max(F-K,0)`.
     /// No discretisation bias at any step count (`sigma = 0` gives the
-    /// deterministic intrinsic).
+    /// deterministic intrinsic and a standard error of exactly 0).  Same
+    /// validation as [`Self::caplet`] plus `reset > 0`.
     #[allow(clippy::too_many_arguments)]
     pub fn mc_caplet(
         &self,
@@ -451,10 +604,10 @@ impl HullWhite {
         n_paths: usize,
         seed: u64,
     ) -> Result<(f64, f64)> {
-        let tau = pay - reset;
-        if tau <= 0.0 || reset <= 0.0 {
+        let tau = Self::check_caplet_inputs("mc_caplet", reset, pay, strike, notional)?;
+        if reset <= 0.0 {
             return Err(IrmError::InvalidInput(format!(
-                "need 0 < reset < pay, got {reset}, {pay}"
+                "mc_caplet: need 0 < reset < pay, got {reset}, {pay}"
             )));
         }
         if n_steps < 1 || n_paths < 1 {
@@ -466,7 +619,7 @@ impl HullWhite {
         let m = ou_step_moments(self.a, self.sigma, dt)?;
         let mut rng = StdRng::seed_from_u64(seed);
         let df_reset = self.curve.df(reset)?;
-        let v_reset = self.variance_integral(reset);
+        let v_reset = self.variance_integral(reset)?;
         let alpha_reset = self.alpha(reset)?;
         let b = self.b_factor(reset, pay)?;
         let a_f = self.a_factor(reset, pay)?;
@@ -512,4 +665,326 @@ impl HullWhite {
         };
         Ok((price, se))
     }
+}
+
+// --------------------------------------------------------------------- //
+// Calibration of (a, sigma) to caplet / swaption prices
+// --------------------------------------------------------------------- //
+
+/// Market caplet price per unit notional on `[reset, pay]` at `strike`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CapletQuote {
+    /// Reset (fixing) time.
+    pub reset: f64,
+    /// Payment time.
+    pub pay: f64,
+    /// Strike rate.
+    pub strike: f64,
+    /// Market price per unit notional.
+    pub price: f64,
+}
+
+impl CapletQuote {
+    /// Validated constructor: finite fields, `0 <= reset < pay`,
+    /// `1 + K tau > 0`, `price >= 0`.
+    pub fn new(reset: f64, pay: f64, strike: f64, price: f64) -> Result<Self> {
+        check_finite("reset", reset)?;
+        check_finite("pay", pay)?;
+        check_finite("strike", strike)?;
+        check_finite("price", price)?;
+        if reset < 0.0 || pay <= reset {
+            return Err(IrmError::InvalidInput(format!(
+                "caplet quote needs 0 <= reset < pay, got {reset}, {pay}"
+            )));
+        }
+        if 1.0 + strike * (pay - reset) <= 0.0 {
+            return Err(IrmError::InvalidInput(
+                "caplet quote strike implies non-positive 1 + K*tau".into(),
+            ));
+        }
+        if price < 0.0 {
+            return Err(IrmError::InvalidInput(format!(
+                "caplet quote price must be >= 0, got {price}"
+            )));
+        }
+        Ok(Self { reset, pay, strike, price })
+    }
+}
+
+/// Market *payer* swaption price per unit notional.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwaptionQuote {
+    /// Option expiry (swap start).
+    pub expiry: f64,
+    /// Fixed-leg payment times, strictly increasing and after expiry.
+    pub pay_times: Vec<f64>,
+    /// Fixed rate of the underlying swap.
+    pub fixed_rate: f64,
+    /// Market price per unit notional.
+    pub price: f64,
+}
+
+impl SwaptionQuote {
+    /// Validated constructor: finite fields, `expiry > 0`, a non-empty
+    /// strictly increasing schedule after expiry, `price >= 0`.
+    pub fn new(expiry: f64, pay_times: &[f64], fixed_rate: f64, price: f64) -> Result<Self> {
+        check_finite("expiry", expiry)?;
+        check_finite("fixed_rate", fixed_rate)?;
+        check_finite("price", price)?;
+        if expiry <= 0.0 {
+            return Err(IrmError::InvalidInput(format!(
+                "swaption quote expiry must be > 0, got {expiry}"
+            )));
+        }
+        if pay_times.is_empty() {
+            return Err(IrmError::InvalidInput(
+                "swaption quote needs at least one payment time".into(),
+            ));
+        }
+        let mut prev = expiry;
+        for &t in pay_times {
+            if !t.is_finite() || t <= prev {
+                return Err(IrmError::InvalidInput(
+                    "swaption quote payment times must be finite, strictly increasing and \
+                     after expiry"
+                        .into(),
+                ));
+            }
+            prev = t;
+        }
+        if price < 0.0 {
+            return Err(IrmError::InvalidInput(format!(
+                "swaption quote price must be >= 0, got {price}"
+            )));
+        }
+        Ok(Self {
+            expiry,
+            pay_times: pay_times.to_vec(),
+            fixed_rate,
+            price,
+        })
+    }
+}
+
+/// Outcome of [`calibrate_hullwhite`] (same diagnostics as
+/// [`crate::vasicek::VasicekCalibration`]).
+///
+/// `rmse` is in price units per unit notional.  `converged` means the
+/// optimiser converged at the best start *and* the solution is not at a
+/// domain bound (`a < 1e-5` or `> 4.995`, `sigma < 1e-5` or `> 0.999`).
+/// `identified` requires `n_starts >= 2` and `a_spread <= 1e-2`,
+/// `sigma_spread <= 1e-4` over the starts whose rmse is within 5 % of the
+/// best.  `a_fixed` is `true` when `a` was supplied, not fitted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HullWhiteCalibration {
+    /// Fitted (or fixed) mean reversion.
+    pub a: f64,
+    /// Fitted volatility.
+    pub sigma: f64,
+    /// Root-mean-square price error per unit notional.
+    pub rmse: f64,
+    /// Optimiser iterations of the best start.
+    pub iterations: usize,
+    /// Optimiser converged and the solution is not at a bound.
+    pub converged: bool,
+    /// Solution at the edge of the domain.
+    pub at_bound: bool,
+    /// Number of starts run.
+    pub n_starts: usize,
+    /// Spread of `a` over equivalent starts.
+    pub a_spread: f64,
+    /// Spread of sigma over equivalent starts.
+    pub sigma_spread: f64,
+    /// Equivalent starts agree (multi-start only).
+    pub identified: bool,
+    /// `a` was held fixed at the supplied value.
+    pub a_fixed: bool,
+}
+
+impl HullWhiteCalibration {
+    /// Build the calibrated model on `curve`.
+    pub fn model(&self, curve: DiscountCurve) -> Result<HullWhite> {
+        HullWhite::new(self.a, self.sigma, curve)
+    }
+}
+
+struct HwStartResult {
+    fx: f64,
+    a: f64,
+    sigma: f64,
+    iterations: usize,
+    converged: bool,
+}
+
+/// Fit `(a, sigma)` to caplet and payer-swaption prices by least squares.
+///
+/// Minimises `sum_j (model_price_j - market_price_j)^2` over all quotes
+/// (prices per unit notional) with Nelder-Mead on `(a, 10 sigma)`
+/// (`initial_step = 0.05`, i.e. 0.005 in sigma); out-of-domain points
+/// (`a <= 1e-6`, `a > 5`, `sigma < 0`, `sigma > 1`) get the penalty
+/// `1e6 (1 + distance)`.
+///
+/// * `x0 = None`: three starts from [`HW_CALIBRATION_STARTS`], best
+///   objective returned with spreads over equivalent starts.
+/// * `x0 = Some([a, sigma])`: single warm start.
+/// * `a_fixed = Some(a)`: fit sigma only (1-D), starting at the sigma values
+///   of the default starts; `x0[0]` is ignored.
+///
+/// At least one quote is required; with both parameters free at least two
+/// quotes of different expiry/tenor are needed for identifiability (a single
+/// quote fits sigma for any `a` — `identified` will be `false`).
+/// Non-convergence is reported, never an error.  Quotes are trusted as
+/// given: convert broker normal vols with [`crate::bachelier::bachelier_price`]
+/// first.  Errors: no quotes, non-finite `x0`, non-positive `a_fixed`,
+/// `maxiter < 1`, or a quote the model cannot price (propagated).
+pub fn calibrate_hullwhite(
+    curve: &DiscountCurve,
+    caplets: &[CapletQuote],
+    swaptions: &[SwaptionQuote],
+    a_fixed: Option<f64>,
+    x0: Option<[f64; 2]>,
+    maxiter: usize,
+) -> Result<HullWhiteCalibration> {
+    if caplets.is_empty() && swaptions.is_empty() {
+        return Err(IrmError::InvalidInput(
+            "calibrate_hullwhite needs at least one caplet or swaption quote".into(),
+        ));
+    }
+    if maxiter < 1 {
+        return Err(IrmError::InvalidInput("maxiter must be >= 1".into()));
+    }
+    if let Some(start) = x0 {
+        if start.iter().any(|v| !v.is_finite()) {
+            return Err(IrmError::InvalidInput("x0 must be finite".into()));
+        }
+    }
+    if let Some(a) = a_fixed {
+        if !a.is_finite() || a <= 0.0 {
+            return Err(IrmError::InvalidInput(format!(
+                "a_fixed must be finite and > 0, got {a}"
+            )));
+        }
+    }
+    let (a_lo, a_hi, s_hi) = HW_DOMAIN;
+    let fixed = a_fixed.is_some();
+    let n_quotes = (caplets.len() + swaptions.len()) as f64;
+
+    // The objective cannot fail for in-domain parameters and validated
+    // quotes; a pricing error would be a bug, but never panic: it is
+    // recorded and re-raised after the optimiser returns.
+    let mut pricing_error: Option<IrmError> = None;
+    let mut sse = |a: f64, sigma: f64| -> f64 {
+        if a <= a_lo || a > a_hi || sigma < 0.0 || sigma > s_hi {
+            return 1e6
+                * (1.0
+                    + (a_lo - a).max(0.0)
+                    + (a - a_hi).max(0.0)
+                    + (-sigma).max(0.0)
+                    + (sigma - s_hi).max(0.0));
+        }
+        let inner = || -> Result<f64> {
+            let hw = HullWhite::new(a, sigma, curve.clone())?;
+            let mut total = 0.0;
+            for q in caplets {
+                let d = hw.caplet(q.reset, q.pay, q.strike, 1.0)? - q.price;
+                total += d * d;
+            }
+            for q in swaptions {
+                let d = hw
+                    .jamshidian_swaption(q.expiry, &q.pay_times, q.fixed_rate, 1.0, true)?
+                    .value
+                    - q.price;
+                total += d * d;
+            }
+            Ok(total)
+        };
+        match inner() {
+            Ok(v) => v,
+            Err(e) => {
+                pricing_error = Some(e);
+                f64::INFINITY
+            }
+        }
+    };
+    // Nelder-Mead uses one initial_step (0.05) for every coordinate, so the
+    // optimiser works on sigma * SIGMA_SCALE (step 0.005 in sigma units).
+    let starts: Vec<Vec<f64>> = match (fixed, x0) {
+        (true, Some(st)) => vec![vec![st[1] * SIGMA_SCALE]],
+        (true, None) => HW_CALIBRATION_STARTS
+            .iter()
+            .map(|&(_, s)| vec![s * SIGMA_SCALE])
+            .collect(),
+        (false, Some(st)) => vec![vec![st[0], st[1] * SIGMA_SCALE]],
+        (false, None) => HW_CALIBRATION_STARTS
+            .iter()
+            .map(|&(a, s)| vec![a, s * SIGMA_SCALE])
+            .collect(),
+    };
+
+    let mut results: Vec<HwStartResult> = Vec::with_capacity(starts.len());
+    for st in &starts {
+        let res = nelder_mead(
+            |p: &[f64]| match a_fixed {
+                Some(a) => sse(a, p[0] / SIGMA_SCALE),
+                None => sse(p[0], p[1] / SIGMA_SCALE),
+            },
+            st,
+            0.05,
+            1e-10,
+            1e-14,
+            maxiter,
+        )?;
+        let (a_val, s_val) = match a_fixed {
+            Some(a) => (a, res.x[0].abs() / SIGMA_SCALE),
+            None => (res.x[0], res.x[1].abs() / SIGMA_SCALE),
+        };
+        results.push(HwStartResult {
+            fx: res.fx,
+            a: a_val,
+            sigma: s_val,
+            iterations: res.iterations,
+            converged: res.converged,
+        });
+    }
+    if let Some(e) = pricing_error {
+        return Err(e);
+    }
+    let mut best = 0;
+    for i in 1..results.len() {
+        if results[i].fx < results[best].fx {
+            best = i;
+        }
+    }
+    let b = &results[best];
+    let rmse = (b.fx.max(0.0) / n_quotes).sqrt();
+    let at_bound = (!fixed && (b.a < A_LO_BOUND || b.a > A_HI_BOUND))
+        || b.sigma < SIGMA_LO_BOUND
+        || b.sigma > SIGMA_HI_BOUND;
+    let (mut a_min, mut a_max) = (b.a, b.a);
+    let (mut s_min, mut s_max) = (b.sigma, b.sigma);
+    for r in &results {
+        let r_rmse = (r.fx.max(0.0) / n_quotes).sqrt();
+        if r_rmse <= EQUIV_RMSE_FACTOR * rmse + EQUIV_RMSE_FLOOR {
+            a_min = a_min.min(r.a);
+            a_max = a_max.max(r.a);
+            s_min = s_min.min(r.sigma);
+            s_max = s_max.max(r.sigma);
+        }
+    }
+    let a_spread = a_max - a_min;
+    let sigma_spread = s_max - s_min;
+    let identified = results.len() >= 2 && a_spread <= IDENT_A && sigma_spread <= IDENT_SIGMA;
+    Ok(HullWhiteCalibration {
+        a: b.a,
+        sigma: b.sigma,
+        rmse,
+        iterations: b.iterations,
+        converged: b.converged && !at_bound,
+        at_bound,
+        n_starts: results.len(),
+        a_spread,
+        sigma_spread,
+        identified,
+        a_fixed: fixed,
+    })
 }

@@ -4,7 +4,7 @@ package com.quant.irm;
  * Forward rate agreement fixing the simple forward over {@code [start, end]}.
  *
  * @param start accrual start in years, &gt;= 0
- * @param end   accrual end in years, &gt; start (the pillar)
+ * @param end   accrual end in years, &gt; start (the pillar), within {@code [1e-6, 200]}
  * @param rate  simple forward rate (decimal); must satisfy {@code 1 + R*tau > 0}
  */
 public record Fra(double start, double end, double rate) implements Instrument {
@@ -17,6 +17,7 @@ public record Fra(double start, double end, double rate) implements Instrument {
         if (!(Double.isFinite(start) && Double.isFinite(end))) {
             throw new IllegalArgumentException("FRA times must be finite");
         }
+        Bootstrap.checkMaturity("FRA end", end);
         if (start < 0.0 || end <= start) {
             throw new IllegalArgumentException(
                     "FRA needs 0 <= start < end, got start=" + start + ", end=" + end);

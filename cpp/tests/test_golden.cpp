@@ -8,6 +8,7 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -100,6 +101,13 @@ std::map<std::string, double> evaluate(const std::string& name, const mini_json:
         }
         return {{"df", c.df(in.at("t").as_number())}};
     }
+    if (name == "vas_calib_sigma_fixed") {
+        const auto [ts, ys] = irm::load_zero_yields(kDataDir + "/zero_yields.csv");
+        const irm::VasicekCalibration cal = irm::calibrate_vasicek(
+            ts, ys, in.at("r0").as_number(), std::nullopt, 4000, in.at("sigma_fixed").as_number());
+        EXPECT_TRUE(cal.converged && cal.identified && !cal.at_bound);
+        return {{"kappa", cal.kappa}, {"theta", cal.theta}};
+    }
     if (starts_with(name, "vas_")) {
         const irm::Vasicek m = vasicek_from_inputs(in);
         if (name == "vas_rT_mean") return {{"mean", m.r_mean(in.at("T").as_number())}};
@@ -122,10 +130,47 @@ std::map<std::string, double> evaluate(const std::string& name, const mini_json:
         }
         return {{"price", m.zcb_price(in.at("T").as_number())}};
     }
+    if (starts_with(name, "bach_")) {
+        if (name == "bach_implied_vol_payer") {
+            return {{"vol", irm::bachelier_implied_vol(
+                                in.at("price").as_number(), in.at("forward").as_number(),
+                                in.at("strike").as_number(), in.at("expiry").as_number(),
+                                in.at("annuity").as_number(), true)}};
+        }
+        return {{"price", irm::bachelier_price(in.at("forward").as_number(),
+                                               in.at("strike").as_number(),
+                                               in.at("expiry").as_number(),
+                                               in.at("vol").as_number(),
+                                               in.at("annuity").as_number(), true)}};
+    }
+    if (name == "hw_calib_recover") {
+        const irm::DiscountCurve curve = curve_from_inputs(in);
+        std::vector<irm::CapletQuote> caps;
+        for (int i = 1; in.has("cap_price_" + std::to_string(i)); ++i) {
+            caps.emplace_back(in.at("cap_reset_" + std::to_string(i)).as_number(),
+                              in.at("cap_pay_" + std::to_string(i)).as_number(),
+                              in.at("strike").as_number(),
+                              in.at("cap_price_" + std::to_string(i)).as_number());
+        }
+        const double e = in.at("swpt_expiry").as_number();
+        const int n = static_cast<int>(std::lround(in.at("swpt_tenor_years").as_number()));
+        std::vector<double> pays;
+        for (int k = 1; k <= n; ++k) pays.push_back(e + k);
+        const std::vector<irm::SwaptionQuote> swps = {
+            irm::SwaptionQuote(e, pays, in.at("swpt_fixed_rate").as_number(),
+                               in.at("swpt_price").as_number())};
+        const irm::HullWhiteCalibration cal = irm::calibrate_hullwhite(curve, caps, swps);
+        EXPECT_TRUE(cal.converged && cal.identified && !cal.at_bound);
+        return {{"a", cal.a}, {"sigma", cal.sigma}};
+    }
     if (starts_with(name, "hw_")) {
         const irm::HullWhite hw = hw_from_inputs(in);
         if (name == "hw_zcb_t0") {
             return {{"price", hw.zcb_price(0.0, in.at("T").as_number())}};
+        }
+        if (name == "hw_zcb_t1_explicit_r") {
+            return {{"price", hw.zcb_price(in.at("t").as_number(), in.at("T").as_number(),
+                                           in.at("r").as_number())}};
         }
         if (name == "hw_caplet" || name == "hw_caplet_sigma0") {
             return {{"price", hw.caplet(in.at("reset").as_number(), in.at("pay").as_number(),
@@ -138,20 +183,26 @@ std::map<std::string, double> evaluate(const std::string& name, const mini_json:
                                  in.at("strike").as_number(), in.at("notional").as_number())}};
         }
         if (name == "hw_cap_3y") {
-            const std::vector<double> sched = {in.at("t0").as_number(), in.at("t1").as_number(),
-                                               in.at("t2").as_number(), in.at("t3").as_number()};
+            // Schedule keys are s0..s3 (t1..t5 are the curve pillars).
+            const std::vector<double> sched = {in.at("s0").as_number(), in.at("s1").as_number(),
+                                               in.at("s2").as_number(), in.at("s3").as_number()};
             return {{"price",
                      hw.cap(sched, in.at("strike").as_number(), in.at("notional").as_number())}};
         }
-        if (name == "hw_swaption_payer" || name == "hw_swaption_neg_curve") {
+        if (name == "hw_swaption_payer" || name == "hw_swaption_neg_curve" ||
+            name == "hw_swaption_receiver") {
             const double expiry = in.at("expiry").as_number();
             const int n = static_cast<int>(std::lround(in.at("tenor_years").as_number()));
             std::vector<double> pay_times;
             for (int i = 1; i <= n; ++i) pay_times.push_back(expiry + i);
             const irm::JamshidianResult res = hw.jamshidian_swaption(
                 expiry, pay_times, in.at("fixed_rate").as_number(),
-                in.at("notional").as_number());
-            return {{"price", res.value}};
+                in.at("notional").as_number(), /*payer=*/name != "hw_swaption_receiver");
+            std::map<std::string, double> out = {{"price", res.value}, {"r_star", res.r_star}};
+            for (std::size_t i = 0; i < res.strikes.size(); ++i) {
+                out["strike_" + std::to_string(i + 1)] = res.strikes[i];
+            }
+            return out;
         }
         if (name == "hw_mc_caplet") {
             const int n_paths = static_cast<int>(in.at("min_paths").as_number());
@@ -166,25 +217,47 @@ std::map<std::string, double> evaluate(const std::string& name, const mini_json:
     return {};
 }
 
-TEST(Golden, AllCasesWithinTolerance) {
-    const auto& cases = golden().at("cases").as_array();
-    ASSERT_GE(cases.size(), 20u);
+/// Case names, read once so every case becomes its own parameterised test
+/// (a single bad case cannot mask the others).
+std::vector<std::string> case_names() {
     std::vector<std::string> names;
-    for (const auto& cp : cases) {
-        const mini_json::Value& c = *cp;
-        const std::string name = c.at("name").as_string();
-        names.push_back(name);
-        const double tol = c.at("tol").as_number();
-        const std::map<std::string, double> got = evaluate(name, c.at("inputs"));
-        for (const auto& [key, expected_ptr] : c.at("expect").obj) {
-            const double expected = expected_ptr->as_number();
-            ASSERT_TRUE(got.count(key)) << name << ": missing output " << key;
-            EXPECT_NEAR(got.at(key), expected, tol)
-                << name << "." << key << ": got " << got.at(key) << ", want " << expected
-                << " +- " << tol;
-        }
+    for (const auto& cp : golden().at("cases").as_array()) {
+        names.push_back(cp->at("name").as_string());
     }
-    // No duplicate case names.
+    return names;
+}
+
+const mini_json::Value& find_case(const std::string& name) {
+    for (const auto& cp : golden().at("cases").as_array()) {
+        if (cp->at("name").as_string() == name) return *cp;
+    }
+    throw std::runtime_error("golden case not found: " + name);
+}
+
+class GoldenCase : public ::testing::TestWithParam<std::string> {};
+
+TEST_P(GoldenCase, WithinTolerance) {
+    const mini_json::Value& c = find_case(GetParam());
+    const std::string name = c.at("name").as_string();
+    const double tol = c.at("tol").as_number();
+    const std::map<std::string, double> got = evaluate(name, c.at("inputs"));
+    for (const auto& [key, expected_ptr] : c.at("expect").obj) {
+        const double expected = expected_ptr->as_number();
+        ASSERT_TRUE(got.count(key)) << name << ": missing output " << key;
+        EXPECT_NEAR(got.at(key), expected, tol)
+            << name << "." << key << ": got " << got.at(key) << ", want " << expected
+            << " +- " << tol;
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(All, GoldenCase, ::testing::ValuesIn(case_names()),
+                         [](const ::testing::TestParamInfo<std::string>& info) {
+                             return info.param;
+                         });
+
+TEST(Golden, ExactCaseCountAndUniqueNames) {
+    const std::vector<std::string> names = case_names();
+    EXPECT_EQ(names.size(), 33u);
     std::vector<std::string> sorted = names;
     std::sort(sorted.begin(), sorted.end());
     EXPECT_TRUE(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end())

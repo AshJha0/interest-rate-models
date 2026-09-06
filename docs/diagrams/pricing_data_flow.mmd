@@ -3,12 +3,12 @@ flowchart TD
     CQ[curve_quotes.csv<br/>EUR + USD deposits/swaps]
     OQ[ois_quotes.csv]
     ZY[zero_yields.csv]
-    GJ[golden/golden.json]
+    GJ[golden/golden.json<br/>33 cases]
   end
 
   subgraph curvebuild["Curve construction"]
-    L[quotes loaders] --> INS["instruments<br/>Deposit / FRA / Swap / OISSwap<br/>(validated at construction)"]
-    INS --> BS["bootstrap: per pillar<br/>solve residual(DF)=0<br/>Brent on [1e-10, 100]"]
+    L[quotes loaders] --> INS["instruments<br/>Deposit / FRA / Swap / OISSwap<br/>(validated at construction,<br/>maturity in [1e-6, 200] y)"]
+    INS --> BS["bootstrap: per pillar<br/>solve_pillar_df on [1e-10, 100]<br/>bracket failure = crossed quotes<br/>other failure = solver failed"]
     BS --> DC["DiscountCurve<br/>ln-DF linear = piecewise-const forwards<br/>df / zero_rate / inst_forward / fwd_rate"]
   end
 
@@ -16,7 +16,7 @@ flowchart TD
   OQ --> L
 
   subgraph vas["Vasicek"]
-    CAL["calibrate_vasicek<br/>Nelder-Mead least squares"] --> VM["Vasicek(kappa, theta, sigma, r0)"]
+    CAL["calibrate_vasicek<br/>3 starts, sigma_fixed option<br/>at_bound / identified"] --> VM["Vasicek(kappa, theta, sigma, r0)"]
     VM --> VP["zcb_price / zero_yield<br/>r_mean / r_var<br/>zbc / zbp"]
     VM --> VMC["mc_zcb<br/>exact OU transitions"]
   end
@@ -27,14 +27,37 @@ flowchart TD
     FWD --> AB["A(t,T), B(t,T)<br/>market DFs, exact fit at t=0"]
     AB --> OPT["zbc / zbp"]
     OPT --> CAPS["caplet / floorlet / cap"]
-    AB --> JAM["jamshidian_swaption<br/>Brent for r*, expand bracket"]
+    AB --> JAM["jamshidian_swaption<br/>Brent for r*, expand bracket<br/>jamshidian_at_r_star: |g(r*)| < 1e-10, g'(r*) < 0"]
     OPT --> JAM
     AB --> HMC["mc_caplet<br/>x + alpha(t), exact pathwise DF"]
+    CAPS --> HCAL["calibrate_hullwhite<br/>(a, sigma) to caplet/swaption prices<br/>3 starts, a_fixed option"]
+    JAM --> HCAL
   end
 
-  VP --> TESTS["golden tests<br/>Python / C++ / Rust / Java"]
+  subgraph normal["Bachelier"]
+    BACH["bachelier_price /<br/>bachelier_implied_vol<br/>(bp vol quotes)"]
+  end
+  BACH -- "quotes -> prices" --> HCAL
+  CAPS -- "prices -> bp vols" --> BACH
+
+  subgraph kern["shared kernels (native in every port)"]
+    OU["ou_step_moments /<br/>ou_integral_variance<br/>expm1 + series for a*dt < 1e-2"]
+    RF["brentq / bisect<br/>non-finite value = error"]
+    NM["nelder_mead"]
+  end
+  OU --> VMC
+  OU --> HMC
+  RF --> BS
+  RF --> JAM
+  RF --> BACH
+  NM --> CAL
+  NM --> HCAL
+
+  VP --> TESTS["golden tests<br/>Python / C++ / Rust / Java<br/>one test per case"]
   CAPS --> TESTS
   JAM --> TESTS
+  HCAL --> TESTS
+  BACH --> TESTS
   DC --> TESTS
   VMC -- "6-SE bands" --> TESTS
   HMC -- "6-SE bands" --> TESTS

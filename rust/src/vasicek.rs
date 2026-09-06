@@ -16,9 +16,11 @@
 //!
 //! Monte Carlo uses the *exact* OU transition of the pair
 //! `(r, int r dt)` (see [`crate::mathutils`]), so the ZCB estimator is
-//! unbiased at any step count.  Calibration fits `(kappa, theta, sigma)`
-//! to market zero yields by least squares with the native Nelder-Mead from
-//! [`crate::optimize`].
+//! unbiased at any step count.  Calibration fits `(kappa, theta, sigma)` —
+//! or `(kappa, theta)` with `sigma` fixed from option prices — to market
+//! zero yields by least squares with the native Nelder-Mead from
+//! [`crate::optimize`], from several starting points, and reports
+//! identifiability and boundary diagnostics.
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -27,6 +29,29 @@ use rand_distr::StandardNormal;
 use crate::error::{IrmError, Result};
 use crate::mathutils::{norm_cdf, ou_step_moments};
 use crate::optimize::nelder_mead;
+
+/// Calibration domain: `kappa in (1e-6, 50]`, `|theta| <= 5`, `sigma in [0, 5]`;
+/// points outside get the penalty `1e6 (1 + distance)`.
+pub const VASICEK_DOMAIN: (f64, f64, f64, f64) = (1e-6, 50.0, 5.0, 5.0);
+/// Default multi-start `(kappa, sigma)` pairs; theta starts at the mean yield.
+pub const CALIBRATION_STARTS: [(f64, f64); 3] = [(0.2, 0.005), (0.5, 0.01), (1.5, 0.02)];
+
+/// Largest exponent passed to exp() before a ZCB price is declared not
+/// representable (exp(709.78) is the double overflow point).
+const MAX_EXP_ARG: f64 = 700.0;
+// at_bound thresholds (documented in API_SPEC section 7).
+const KAPPA_LO_BOUND: f64 = 1e-5; // 10x the penalty floor 1e-6
+const KAPPA_HI_BOUND: f64 = 49.95; // within 1e-3 of the range from 50
+const THETA_BOUND: f64 = 4.995;
+const SIGMA_LO_BOUND: f64 = 1e-5;
+const SIGMA_HI_BOUND: f64 = 4.995;
+// Starts whose rmse is within 5 % of the best are "equivalent fits"; their
+// parameter spreads must be below these to call the solution identified.
+const EQUIV_RMSE_FACTOR: f64 = 1.05;
+const EQUIV_RMSE_FLOOR: f64 = 1e-12;
+const IDENT_KAPPA: f64 = 1e-2;
+const IDENT_THETA: f64 = 1e-3;
+const IDENT_SIGMA: f64 = 1e-3;
 
 /// Vasicek model with parameters `kappa > 0`, `sigma >= 0`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -85,15 +110,16 @@ impl Vasicek {
 
     /// `B(t,T)` with `tau = T - t`: duration of the ZCB w.r.t. `r`.
     ///
-    /// `B = (1 - e^{-kappa tau})/kappa`; it is the sensitivity
-    /// `-d ln P / d r` and appears in every option/moment formula.
+    /// `B = (1 - e^{-kappa tau})/kappa` (evaluated with `exp_m1`); it is
+    /// the sensitivity `-d ln P / d r` and appears in every option/moment
+    /// formula.
     pub fn b_factor(&self, tau: f64) -> Result<f64> {
         if !tau.is_finite() || tau < 0.0 {
             return Err(IrmError::InvalidInput(format!(
                 "tau must be finite and >= 0, got {tau}"
             )));
         }
-        Ok((1.0 - (-self.kappa * tau).exp()) / self.kappa)
+        Ok(-(-self.kappa * tau).exp_m1() / self.kappa)
     }
 
     /// `A(t,T)` with `tau = T - t` (depends on `tau` only):
@@ -112,22 +138,38 @@ impl Vasicek {
 
     /// Zero-coupon bond price `P(t, maturity) = A e^{-B r(t)}`.
     ///
-    /// `r = None` defaults to `r0` (only sensible for `t = 0`).
+    /// `r = None` defaults to `r0` (only sensible for `t = 0`).  Errors on
+    /// non-finite inputs, `maturity < t`, or when `exp(-B r)` would overflow
+    /// (result not representable).
     pub fn zcb_price(&self, maturity: f64, t: f64, r: Option<f64>) -> Result<f64> {
+        if !maturity.is_finite() || !t.is_finite() {
+            return Err(IrmError::InvalidInput("maturity and t must be finite".into()));
+        }
         if maturity < t {
             return Err(IrmError::InvalidInput(format!(
                 "maturity {maturity} before valuation time {t}"
             )));
         }
         let rr = r.unwrap_or(self.r0);
+        if !rr.is_finite() {
+            return Err(IrmError::InvalidInput(format!(
+                "short rate must be finite, got {rr}"
+            )));
+        }
         let tau = maturity - t;
-        Ok(self.a_factor(tau)? * (-self.b_factor(tau)? * rr).exp())
+        let expo = -self.b_factor(tau)? * rr;
+        if expo > MAX_EXP_ARG {
+            return Err(IrmError::InvalidInput(format!(
+                "ZCB price not representable: exp({expo}) overflows"
+            )));
+        }
+        Ok(self.a_factor(tau)? * expo.exp())
     }
 
     /// Continuously compounded zero yield `-ln P(t,T) / (T - t)`.
     pub fn zero_yield(&self, maturity: f64, t: f64, r: Option<f64>) -> Result<f64> {
         let tau = maturity - t;
-        if tau <= 0.0 {
+        if !tau.is_finite() || tau <= 0.0 {
             return Err(IrmError::InvalidInput(format!(
                 "need maturity > t, got tau={tau}"
             )));
@@ -146,6 +188,11 @@ impl Vasicek {
             )));
         }
         let rr = r.unwrap_or(self.r0);
+        if !rr.is_finite() {
+            return Err(IrmError::InvalidInput(format!(
+                "short rate must be finite, got {rr}"
+            )));
+        }
         Ok(self.theta + (rr - self.theta) * (-self.kappa * horizon).exp())
     }
 
@@ -156,7 +203,7 @@ impl Vasicek {
                 "horizon must be >= 0, got {horizon}"
             )));
         }
-        Ok(self.sigma * self.sigma * (1.0 - (-2.0 * self.kappa * horizon).exp())
+        Ok(self.sigma * self.sigma * (-(-2.0 * self.kappa * horizon).exp_m1())
             / (2.0 * self.kappa))
     }
 
@@ -166,7 +213,7 @@ impl Vasicek {
     /// `sigma_p = sigma sqrt((1 - e^{-2 kappa T})/(2 kappa)) B(S - T)`.
     fn sigma_p(&self, expiry: f64, bond_maturity: f64) -> Result<f64> {
         Ok(self.sigma
-            * ((1.0 - (-2.0 * self.kappa * expiry).exp()) / (2.0 * self.kappa)).sqrt()
+            * ((-(-2.0 * self.kappa * expiry).exp_m1()) / (2.0 * self.kappa)).sqrt()
             * self.b_factor(bond_maturity - expiry)?)
     }
 
@@ -281,7 +328,8 @@ impl Vasicek {
     }
 
     /// MC ZCB price `E[e^{-int r}]` and its standard error
-    /// (`stdev/sqrt(n_paths)`, sample stdev with ddof 1).
+    /// (`stdev/sqrt(n_paths)`, sample stdev with ddof 1; exactly 0 for
+    /// `sigma = 0` or a single path).
     pub fn mc_zcb(
         &self,
         maturity: f64,
@@ -305,22 +353,52 @@ impl Vasicek {
 }
 
 /// Least-squares calibration outcome (non-convergence reported, not raised).
+///
+/// * `converged`: the optimiser met its tolerances at the reported solution
+///   **and** the solution is not at a domain bound.
+/// * `at_bound`: the solution sits at the edge of the calibration domain
+///   (`kappa < 1e-5` or `> 49.95`, `|theta| > 4.995`, `sigma < 1e-5` or
+///   `> 4.995`) — a penalty-boundary artefact, not a fit.
+/// * `n_starts`: Nelder-Mead starts run (3 by default; 1 when `x0` given).
+/// * `kappa_spread` / `theta_spread` / `sigma_spread`: max minus min of each
+///   parameter over the starts whose rmse is within 5 % of the best (0 for
+///   a single start).
+/// * `identified`: `n_starts >= 2` and all equivalent starts agree
+///   (`kappa_spread <= 1e-2`, `theta_spread <= 1e-3`, `sigma_spread <= 1e-3`).
+///   With a single start identifiability is not assessed and this is `false`.
+/// * `sigma_fixed`: `true` when sigma was supplied, not fitted.
+///
+/// Price on the result only if `converged && (identified || sigma_fixed)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VasicekCalibration {
     /// Fitted mean-reversion speed.
     pub kappa: f64,
     /// Fitted long-run mean.
     pub theta: f64,
-    /// Fitted volatility (returned as `|sigma|`).
+    /// Fitted volatility (returned as `|sigma|`), or the fixed value.
     pub sigma: f64,
     /// Fixed initial short rate.
     pub r0: f64,
     /// Root-mean-square yield error at the optimum.
     pub rmse: f64,
-    /// Optimiser iterations.
+    /// Optimiser iterations of the best start.
     pub iterations: usize,
-    /// Optimiser convergence flag (reported, never an error).
+    /// Optimiser converged and the solution is not at a bound.
     pub converged: bool,
+    /// Solution at the edge of the domain.
+    pub at_bound: bool,
+    /// Number of starts run.
+    pub n_starts: usize,
+    /// Spread of kappa over equivalent starts.
+    pub kappa_spread: f64,
+    /// Spread of theta over equivalent starts.
+    pub theta_spread: f64,
+    /// Spread of sigma over equivalent starts.
+    pub sigma_spread: f64,
+    /// Equivalent starts agree (multi-start only).
+    pub identified: bool,
+    /// Sigma was held fixed at the supplied value.
+    pub sigma_fixed: bool,
 }
 
 impl VasicekCalibration {
@@ -330,19 +408,40 @@ impl VasicekCalibration {
     }
 }
 
+struct StartResult {
+    fx: f64,
+    kappa: f64,
+    theta: f64,
+    sigma: f64,
+    iterations: usize,
+    converged: bool,
+}
+
 /// Fit `(kappa, theta, sigma)` to market zero yields by least squares.
 ///
-/// Minimises `sum_i (y_model(T_i) - y_i)^2` with Nelder-Mead; invalid
-/// regions (`kappa <= 1e-6`, `sigma < 0`, `kappa > 50`, `|theta| > 5`,
-/// `sigma > 5`) are handled with a smooth penalty so the simplex is pushed
-/// back inside the domain.  `r0` is held fixed; start is
-/// `(0.5, mean(y), 0.01)` with `initial_step = 0.05` unless `x0` is given.
+/// Minimises `sum_i (y_model(T_i) - y_i)^2` with Nelder-Mead
+/// (`initial_step = 0.05`); out-of-domain points (`kappa <= 1e-6`,
+/// `kappa > 50`, `|theta| > 5`, `sigma < 0`, `sigma > 5`) get the smooth
+/// penalty `1e6 (1 + distance)` so the simplex is pushed back inside the
+/// domain.  `r0` is held fixed.
+///
+/// * `x0 = None`: three starts `(kappa, mean(y), sigma)` for `(kappa, sigma)`
+///   in [`CALIBRATION_STARTS`]; the lowest objective is returned with the
+///   parameter spreads across equivalent starts.
+/// * `x0 = Some([kappa, theta, sigma])`: a single warm start (all entries
+///   finite; identifiability is then not assessed).
+/// * `sigma_fixed = Some(s)`: fit only `(kappa, theta)` with sigma held at
+///   `s >= 0` — the practitioner workflow; `x0[2]` is ignored.
+///
+/// Yields identify the parameters weakly (the bundled data has two minima
+/// with rmse within 2 %); always check `converged`, `at_bound`, `identified`.
 pub fn calibrate_vasicek(
     maturities: &[f64],
     yields: &[f64],
     r0: f64,
     x0: Option<[f64; 3]>,
     maxiter: usize,
+    sigma_fixed: Option<f64>,
 ) -> Result<VasicekCalibration> {
     if maturities.len() != yields.len() || maturities.len() < 3 {
         return Err(IrmError::InvalidInput(
@@ -360,18 +459,34 @@ pub fn calibrate_vasicek(
     if !r0.is_finite() {
         return Err(IrmError::InvalidInput("r0 must be finite".into()));
     }
+    if maxiter < 1 {
+        return Err(IrmError::InvalidInput("maxiter must be >= 1".into()));
+    }
+    if let Some(start) = x0 {
+        if start.iter().any(|v| !v.is_finite()) {
+            return Err(IrmError::InvalidInput("x0 must be finite".into()));
+        }
+    }
+    if let Some(s) = sigma_fixed {
+        if !s.is_finite() || s < 0.0 {
+            return Err(IrmError::InvalidInput(format!(
+                "sigma_fixed must be finite and >= 0, got {s}"
+            )));
+        }
+    }
+    let (k_lo, k_hi, th_max, s_hi) = VASICEK_DOMAIN;
+    let fixed = sigma_fixed.is_some();
 
-    let objective = |p: &[f64]| -> f64 {
-        let (kappa, theta, sigma) = (p[0], p[1], p[2]);
-        if kappa <= 1e-6 || sigma < 0.0 || kappa > 50.0 || theta.abs() > 5.0 || sigma > 5.0 {
+    let sse = |kappa: f64, theta: f64, sigma: f64| -> f64 {
+        if kappa <= k_lo || sigma < 0.0 || kappa > k_hi || theta.abs() > th_max || sigma > s_hi {
             // Smooth penalty pointing back toward the feasible region.
             return 1e6
                 * (1.0
-                    + (1e-6 - kappa).max(0.0)
+                    + (k_lo - kappa).max(0.0)
                     + (-sigma).max(0.0)
-                    + (kappa - 50.0).max(0.0)
-                    + (theta.abs() - 5.0).max(0.0)
-                    + (sigma - 5.0).max(0.0));
+                    + (kappa - k_hi).max(0.0)
+                    + (theta.abs() - th_max).max(0.0)
+                    + (sigma - s_hi).max(0.0));
         }
         // Parameters are in-domain here, so model construction and yield
         // evaluation (t > 0, validated above) cannot fail.
@@ -385,19 +500,88 @@ pub fn calibrate_vasicek(
             })
             .sum()
     };
+    let objective = |p: &[f64]| -> f64 {
+        match sigma_fixed {
+            Some(s) => sse(p[0], p[1], s),
+            None => sse(p[0], p[1], p[2]),
+        }
+    };
 
-    let start = x0.map(|a| a.to_vec()).unwrap_or_else(|| {
-        vec![0.5, yields.iter().sum::<f64>() / yields.len() as f64, 0.01]
-    });
-    let res = nelder_mead(objective, &start, 0.05, 1e-10, 1e-14, maxiter)?;
-    let rmse = (res.fx.max(0.0) / maturities.len() as f64).sqrt();
+    let mean_y = yields.iter().sum::<f64>() / yields.len() as f64;
+    let starts: Vec<Vec<f64>> = match x0 {
+        Some(start) => vec![start.to_vec()],
+        None => CALIBRATION_STARTS
+            .iter()
+            .map(|&(k, s)| vec![k, mean_y, s])
+            .collect(),
+    };
+
+    let mut results: Vec<StartResult> = Vec::with_capacity(starts.len());
+    for st in &starts {
+        let p0: Vec<f64> = if fixed { st[..2].to_vec() } else { st.clone() };
+        let res = nelder_mead(objective, &p0, 0.05, 1e-10, 1e-14, maxiter)?;
+        let sigma = match sigma_fixed {
+            Some(s) => s,
+            None => res.x[2].abs(),
+        };
+        results.push(StartResult {
+            fx: res.fx,
+            kappa: res.x[0],
+            theta: res.x[1],
+            sigma,
+            iterations: res.iterations,
+            converged: res.converged,
+        });
+    }
+    let mut best = 0;
+    for i in 1..results.len() {
+        if results[i].fx < results[best].fx {
+            best = i;
+        }
+    }
+    let b = &results[best];
+    let n = maturities.len() as f64;
+    let rmse = (b.fx.max(0.0) / n).sqrt();
+    let at_bound = b.kappa < KAPPA_LO_BOUND
+        || b.kappa > KAPPA_HI_BOUND
+        || b.theta.abs() > THETA_BOUND
+        || (!fixed && (b.sigma < SIGMA_LO_BOUND || b.sigma > SIGMA_HI_BOUND));
+
+    let (mut k_min, mut k_max) = (b.kappa, b.kappa);
+    let (mut t_min, mut t_max) = (b.theta, b.theta);
+    let (mut s_min, mut s_max) = (b.sigma, b.sigma);
+    for r in &results {
+        let r_rmse = (r.fx.max(0.0) / n).sqrt();
+        if r_rmse <= EQUIV_RMSE_FACTOR * rmse + EQUIV_RMSE_FLOOR {
+            k_min = k_min.min(r.kappa);
+            k_max = k_max.max(r.kappa);
+            t_min = t_min.min(r.theta);
+            t_max = t_max.max(r.theta);
+            s_min = s_min.min(r.sigma);
+            s_max = s_max.max(r.sigma);
+        }
+    }
+    let kappa_spread = k_max - k_min;
+    let theta_spread = t_max - t_min;
+    let sigma_spread = s_max - s_min;
+    let identified = results.len() >= 2
+        && kappa_spread <= IDENT_KAPPA
+        && theta_spread <= IDENT_THETA
+        && sigma_spread <= IDENT_SIGMA;
     Ok(VasicekCalibration {
-        kappa: res.x[0],
-        theta: res.x[1],
-        sigma: res.x[2].abs(),
+        kappa: b.kappa,
+        theta: b.theta,
+        sigma: b.sigma,
         r0,
         rmse,
-        iterations: res.iterations,
-        converged: res.converged,
+        iterations: b.iterations,
+        converged: b.converged && !at_bound,
+        at_bound,
+        n_starts: results.len(),
+        kappa_spread,
+        theta_spread,
+        sigma_spread,
+        identified,
+        sigma_fixed: fixed,
     })
 }

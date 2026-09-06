@@ -99,7 +99,19 @@ double DiscountCurve::fwd_rate(double t1, double t2) const {
         throw std::invalid_argument("need 0 <= t1 < t2 for a forward rate, got t1=" +
                                     std::to_string(t1) + ", t2=" + std::to_string(t2));
     }
-    return (df(t1) / df(t2) - 1.0) / (t2 - t1);
+    const double df1 = df(t1);
+    const double df2 = df(t2);
+    if (df2 == 0.0) {
+        throw std::invalid_argument("forward rate over [" + std::to_string(t1) + ", " +
+                                    std::to_string(t2) + "] not representable: DF(t2) underflowed to 0");
+    }
+    const double fwd = (df1 / df2 - 1.0) / (t2 - t1);
+    if (!std::isfinite(fwd)) {
+        throw std::invalid_argument("forward rate over [" + std::to_string(t1) + ", " +
+                                    std::to_string(t2) + "] not representable: " +
+                                    std::to_string(fwd));
+    }
+    return fwd;
 }
 
 double par_swap_rate(const DiscountCurve& curve, const std::vector<double>& times) {

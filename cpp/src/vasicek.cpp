@@ -11,6 +11,40 @@
 
 namespace irm {
 
+namespace {
+
+/// Largest exponent passed to exp() before a ZCB price is declared not
+/// representable (exp(709.78) is the double overflow point).
+constexpr double kMaxExpArg = 700.0;
+
+// at_bound thresholds (documented in API_SPEC section 7).
+constexpr double kKappaLoBound = 1e-5;   // 10x the penalty floor 1e-6
+constexpr double kKappaHiBound = 49.95;  // within 1e-3 of the range from 50
+constexpr double kThetaBound = 4.995;
+constexpr double kSigmaLoBound = 1e-5;
+constexpr double kSigmaHiBound = 4.995;
+// Starts whose rmse is within 5 % of the best are "equivalent fits"; their
+// parameter spreads must be below these to call the solution identified.
+constexpr double kEquivRmseFactor = 1.05;
+constexpr double kEquivRmseFloor = 1e-12;
+constexpr double kIdentKappa = 1e-2;
+constexpr double kIdentTheta = 1e-3;
+constexpr double kIdentSigma = 1e-3;
+// Default multi-start (kappa, sigma) pairs; theta starts at the mean yield.
+constexpr double kStartKappa[] = {0.2, 0.5, 1.5};
+constexpr double kStartSigma[] = {0.005, 0.01, 0.02};
+
+struct StartResult {
+    double fx;
+    double kappa;
+    double theta;
+    double sigma;
+    int iterations;
+    bool converged;
+};
+
+}  // namespace
+
 Vasicek::Vasicek(double kappa, double theta, double sigma, double r0)
     : kappa_(kappa), theta_(theta), sigma_(sigma), r0_(r0) {
     const struct { const char* name; double v; } params[] = {
@@ -33,7 +67,7 @@ double Vasicek::b_factor(double tau) const {
     if (!std::isfinite(tau) || tau < 0.0) {
         throw std::invalid_argument("tau must be finite and >= 0, got " + std::to_string(tau));
     }
-    return (1.0 - std::exp(-kappa_ * tau)) / kappa_;
+    return -std::expm1(-kappa_ * tau) / kappa_;
 }
 
 double Vasicek::a_factor(double tau) const {
@@ -43,18 +77,29 @@ double Vasicek::a_factor(double tau) const {
 }
 
 double Vasicek::zcb_price(double maturity, double t, std::optional<double> r) const {
+    if (!(std::isfinite(maturity) && std::isfinite(t))) {
+        throw std::invalid_argument("maturity and t must be finite");
+    }
     if (maturity < t) {
         throw std::invalid_argument("maturity " + std::to_string(maturity) +
                                     " before valuation time " + std::to_string(t));
     }
     const double rr = r.value_or(r0_);
+    if (!std::isfinite(rr)) {
+        throw std::invalid_argument("short rate must be finite, got " + std::to_string(rr));
+    }
     const double tau = maturity - t;
-    return a_factor(tau) * std::exp(-b_factor(tau) * rr);
+    const double expo = -b_factor(tau) * rr;
+    if (expo > kMaxExpArg) {
+        throw std::invalid_argument("ZCB price not representable: exp(" + std::to_string(expo) +
+                                    ") overflows");
+    }
+    return a_factor(tau) * std::exp(expo);
 }
 
 double Vasicek::zero_yield(double maturity, double t, std::optional<double> r) const {
     const double tau = maturity - t;
-    if (tau <= 0.0) {
+    if (!std::isfinite(tau) || tau <= 0.0) {
         throw std::invalid_argument("need maturity > t, got tau=" + std::to_string(tau));
     }
     return -std::log(zcb_price(maturity, t, r)) / tau;
@@ -65,6 +110,9 @@ double Vasicek::r_mean(double horizon, std::optional<double> r) const {
         throw std::invalid_argument("horizon must be >= 0, got " + std::to_string(horizon));
     }
     const double rr = r.value_or(r0_);
+    if (!std::isfinite(rr)) {
+        throw std::invalid_argument("short rate must be finite, got " + std::to_string(rr));
+    }
     return theta_ + (rr - theta_) * std::exp(-kappa_ * horizon);
 }
 
@@ -72,12 +120,12 @@ double Vasicek::r_var(double horizon) const {
     if (!std::isfinite(horizon) || horizon < 0.0) {
         throw std::invalid_argument("horizon must be >= 0, got " + std::to_string(horizon));
     }
-    return sigma_ * sigma_ * (1.0 - std::exp(-2.0 * kappa_ * horizon)) / (2.0 * kappa_);
+    return sigma_ * sigma_ * (-std::expm1(-2.0 * kappa_ * horizon)) / (2.0 * kappa_);
 }
 
 double Vasicek::sigma_p(double expiry, double bond_maturity) const {
     // Std dev of ln P(T,S) at option expiry T for bond maturity S.
-    return sigma_ * std::sqrt((1.0 - std::exp(-2.0 * kappa_ * expiry)) / (2.0 * kappa_)) *
+    return sigma_ * std::sqrt((-std::expm1(-2.0 * kappa_ * expiry)) / (2.0 * kappa_)) *
            b_factor(bond_maturity - expiry);
 }
 
@@ -192,7 +240,8 @@ std::pair<double, double> Vasicek::mc_zcb(double maturity, int n_steps, int n_pa
 
 VasicekCalibration calibrate_vasicek(const std::vector<double>& maturities,
                                      const std::vector<double>& yields, double r0,
-                                     std::optional<std::vector<double>> x0, int maxiter) {
+                                     std::optional<std::vector<double>> x0, int maxiter,
+                                     std::optional<double> sigma_fixed) {
     if (maturities.size() != yields.size() || maturities.size() < 3) {
         throw std::invalid_argument("need at least 3 (maturity, yield) pairs of equal length");
     }
@@ -209,15 +258,31 @@ VasicekCalibration calibrate_vasicek(const std::vector<double>& maturities,
     if (!std::isfinite(r0)) {
         throw std::invalid_argument("r0 must be finite");
     }
+    if (maxiter < 1) {
+        throw std::invalid_argument("maxiter must be >= 1");
+    }
+    if (x0.has_value()) {
+        if (x0->size() != 3) {
+            throw std::invalid_argument("x0 must have 3 entries (kappa, theta, sigma)");
+        }
+        for (double v : *x0) {
+            if (!std::isfinite(v)) throw std::invalid_argument("x0 must be finite");
+        }
+    }
+    if (sigma_fixed.has_value() && (!std::isfinite(*sigma_fixed) || *sigma_fixed < 0.0)) {
+        throw std::invalid_argument("sigma_fixed must be finite and >= 0, got " +
+                                    std::to_string(*sigma_fixed));
+    }
+    const bool fixed = sigma_fixed.has_value();
 
-    const auto objective = [&](const std::vector<double>& p) {
-        const double kappa = p[0], theta = p[1], sigma = p[2];
-        if (kappa <= 1e-6 || sigma < 0.0 || kappa > 50.0 || std::fabs(theta) > 5.0 ||
-            sigma > 5.0) {
+    const auto sse = [&](double kappa, double theta, double sigma) {
+        if (kappa <= kVasicekKappaLo || sigma < 0.0 || kappa > kVasicekKappaHi ||
+            std::fabs(theta) > kVasicekThetaMax || sigma > kVasicekSigmaHi) {
             // Smooth penalty pointing back toward the feasible region.
-            return 1e6 * (1.0 + std::max(0.0, 1e-6 - kappa) + std::max(0.0, -sigma) +
-                          std::max(0.0, kappa - 50.0) + std::max(0.0, std::fabs(theta) - 5.0) +
-                          std::max(0.0, sigma - 5.0));
+            return 1e6 * (1.0 + std::max(0.0, kVasicekKappaLo - kappa) + std::max(0.0, -sigma) +
+                          std::max(0.0, kappa - kVasicekKappaHi) +
+                          std::max(0.0, std::fabs(theta) - kVasicekThetaMax) +
+                          std::max(0.0, sigma - kVasicekSigmaHi));
         }
         const Vasicek model(kappa, theta, sigma, r0);
         double sum = 0.0;
@@ -227,22 +292,71 @@ VasicekCalibration calibrate_vasicek(const std::vector<double>& maturities,
         }
         return sum;
     };
+    const auto objective = [&](const std::vector<double>& p) {
+        return fixed ? sse(p[0], p[1], *sigma_fixed) : sse(p[0], p[1], p[2]);
+    };
 
-    std::vector<double> start;
+    double mean_y = 0.0;
+    for (double y : yields) mean_y += y;
+    mean_y /= static_cast<double>(yields.size());
+    std::vector<std::vector<double>> starts;
     if (x0.has_value()) {
-        start = *x0;
+        starts.push_back(*x0);
     } else {
-        double mean_y = 0.0;
-        for (double y : yields) mean_y += y;
-        mean_y /= static_cast<double>(yields.size());
-        start = {0.5, mean_y, 0.01};
+        for (int k = 0; k < 3; ++k) starts.push_back({kStartKappa[k], mean_y, kStartSigma[k]});
     }
-    const NelderMeadResult res = nelder_mead(objective, start, /*initial_step=*/0.05,
-                                             /*xtol=*/1e-10, /*ftol=*/1e-14, maxiter);
-    const double rmse =
-        std::sqrt(std::max(res.fx, 0.0) / static_cast<double>(maturities.size()));
-    return VasicekCalibration{res.x[0],           res.x[1],       std::fabs(res.x[2]), r0,
-                              rmse,               res.iterations, res.converged};
+
+    std::vector<StartResult> results;
+    for (const auto& st : starts) {
+        const std::vector<double> p0 = fixed ? std::vector<double>{st[0], st[1]} : st;
+        const NelderMeadResult res = nelder_mead(objective, p0, /*initial_step=*/0.05,
+                                                 /*xtol=*/1e-10, /*ftol=*/1e-14, maxiter);
+        const double sigma = fixed ? *sigma_fixed : std::fabs(res.x[2]);
+        results.push_back({res.fx, res.x[0], res.x[1], sigma, res.iterations, res.converged});
+    }
+    std::size_t best = 0;
+    for (std::size_t i = 1; i < results.size(); ++i) {
+        if (results[i].fx < results[best].fx) best = i;
+    }
+    const StartResult& b = results[best];
+    const double n = static_cast<double>(maturities.size());
+    const double rmse = std::sqrt(std::max(b.fx, 0.0) / n);
+    const bool at_bound =
+        b.kappa < kKappaLoBound || b.kappa > kKappaHiBound || std::fabs(b.theta) > kThetaBound ||
+        (!fixed && (b.sigma < kSigmaLoBound || b.sigma > kSigmaHiBound));
+
+    double k_lo = b.kappa, k_hi = b.kappa, t_lo = b.theta, t_hi = b.theta;
+    double s_lo = b.sigma, s_hi = b.sigma;
+    for (const StartResult& r : results) {
+        const double r_rmse = std::sqrt(std::max(r.fx, 0.0) / n);
+        if (r_rmse <= kEquivRmseFactor * rmse + kEquivRmseFloor) {
+            k_lo = std::min(k_lo, r.kappa);
+            k_hi = std::max(k_hi, r.kappa);
+            t_lo = std::min(t_lo, r.theta);
+            t_hi = std::max(t_hi, r.theta);
+            s_lo = std::min(s_lo, r.sigma);
+            s_hi = std::max(s_hi, r.sigma);
+        }
+    }
+    const double kappa_spread = k_hi - k_lo;
+    const double theta_spread = t_hi - t_lo;
+    const double sigma_spread = s_hi - s_lo;
+    const bool identified = results.size() >= 2 && kappa_spread <= kIdentKappa &&
+                            theta_spread <= kIdentTheta && sigma_spread <= kIdentSigma;
+    return VasicekCalibration{b.kappa,
+                              b.theta,
+                              b.sigma,
+                              r0,
+                              rmse,
+                              b.iterations,
+                              b.converged && !at_bound,
+                              at_bound,
+                              static_cast<int>(results.size()),
+                              kappa_spread,
+                              theta_spread,
+                              sigma_spread,
+                              identified,
+                              fixed};
 }
 
 }  // namespace irm

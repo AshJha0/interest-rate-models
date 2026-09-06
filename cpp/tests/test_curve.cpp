@@ -125,4 +125,10 @@ TEST(Curve, ParSwapRate) {
     EXPECT_THROW(irm::par_swap_rate(c, {0.0, 2.0, 1.0}), std::invalid_argument);
 }
 
+TEST(Curve, FwdRateUnderflowIsStandardError) {
+    const irm::DiscountCurve c({1.0}, {0.95});
+    EXPECT_THROW(c.fwd_rate(0.0, 1e6), std::invalid_argument);  // DF(1e6) underflows to 0
+    EXPECT_TRUE(std::isfinite(c.fwd_rate(0.0, 500.0)));
+}
+
 }  // namespace

@@ -22,16 +22,23 @@ a 1-D root find of the instrument's *residual* (PV mispricing):
   with ``annuity = sum_i tau_i DF(t_i)`` over the annual fixed schedule.
 
 The root is found with the native Brent solver on the bracket
-``DF in [1e-10, 100]`` with ``xtol = 1e-14``.  A bracket failure means no
-positive discount factor can reprice the quote — i.e. crossed/arbitrageable
-quotes (the "negative implied DF" case) — and raises ``ValueError``.
+``DF in [1e-10, 100]`` with ``xtol = 1e-14``.  A *bracketing* failure means
+no positive discount factor can reprice the quote — i.e. crossed /
+arbitrageable quotes (the "negative implied DF" case) — and raises
+``ValueError`` naming the pillar and saying so.  Any other solver failure
+(non-convergence, a non-finite residual) is reported as a solver failure
+at that pillar, never relabelled as crossed quotes.
+
+Maturities are bounded to ``[MIN_MATURITY, MAX_MATURITY] = [1e-6, 200]``
+years at construction: an out-of-range maturity (days typed as years, a
+zero-length instrument) is rejected before any schedule is built.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple, Union
+from typing import Callable, List, Sequence, Tuple, Union
 
 from .curve import DiscountCurve
 from .rootfind import brentq
@@ -44,7 +51,18 @@ __all__ = [
     "Instrument",
     "bootstrap",
     "annual_schedule",
+    "solve_pillar_df",
+    "MIN_MATURITY",
+    "MAX_MATURITY",
 ]
+
+#: Smallest instrument maturity / FRA end accepted (years).  Guarantees the
+#: annual schedule has at least one payment.
+MIN_MATURITY = 1e-6
+#: Largest instrument maturity accepted (years).  Bounds the schedule length
+#: (at most 200 payments) so a maturity typed in days cannot allocate
+#: gigabytes or overflow an integer conversion.
+MAX_MATURITY = 200.0
 
 
 def _check_rate(rate: float) -> None:
@@ -52,15 +70,24 @@ def _check_rate(rate: float) -> None:
         raise ValueError(f"quote rate must be finite, got {rate}")
 
 
+def _check_maturity(what: str, maturity: float) -> None:
+    if not math.isfinite(maturity) or maturity < MIN_MATURITY or maturity > MAX_MATURITY:
+        raise ValueError(
+            f"{what} must be finite and within [{MIN_MATURITY}, {MAX_MATURITY}] years, "
+            f"got {maturity}"
+        )
+
+
 def annual_schedule(maturity: float) -> Tuple[float, ...]:
     """Annual fixed-leg payment times ending exactly at ``maturity``.
 
-    ``n = ceil(maturity)`` payments at ``maturity - (n-1), ..., maturity``;
-    e.g. 2.0 -> (1.0, 2.0); 2.5 -> (0.5, 1.5, 2.5); 0.25 -> (0.25,).
-    A short first stub (< 1y) is created for non-integer maturities.
+    ``n = ceil(maturity - 1e-12)`` payments at ``maturity - (n-1), ...,
+    maturity``; e.g. 2.0 -> (1.0, 2.0); 2.5 -> (0.5, 1.5, 2.5);
+    0.25 -> (0.25,).  A short first stub (< 1y) is created for non-integer
+    maturities.  ``maturity`` must lie in ``[MIN_MATURITY, MAX_MATURITY]``
+    (``[1e-6, 200]`` years), so ``1 <= n <= 200`` always.
     """
-    if not math.isfinite(maturity) or maturity <= 0.0:
-        raise ValueError(f"maturity must be finite and > 0, got {maturity}")
+    _check_maturity("maturity", maturity)
     n = math.ceil(maturity - 1e-12)
     return tuple(maturity - (n - 1 - k) for k in range(n))
 
@@ -74,8 +101,7 @@ class Deposit:
 
     def __post_init__(self) -> None:
         _check_rate(self.rate)
-        if not math.isfinite(self.maturity) or self.maturity <= 0.0:
-            raise ValueError(f"deposit maturity must be > 0, got {self.maturity}")
+        _check_maturity("deposit maturity", self.maturity)
         if 1.0 + self.rate * self.maturity <= 0.0:
             raise ValueError(
                 "deposit quote implies non-positive discount factor "
@@ -103,6 +129,7 @@ class FRA:
         _check_rate(self.rate)
         if not (math.isfinite(self.start) and math.isfinite(self.end)):
             raise ValueError("FRA times must be finite")
+        _check_maturity("FRA end", self.end)
         if self.start < 0.0 or self.end <= self.start:
             raise ValueError(
                 f"FRA needs 0 <= start < end, got start={self.start}, end={self.end}"
@@ -187,14 +214,44 @@ _DF_LO = 1e-10
 _DF_HI = 100.0
 
 
+def solve_pillar_df(
+    residual: Callable[[float], float], pillar: float, label: str
+) -> float:
+    """Solve ``residual(DF) = 0`` for one pillar on the bracket ``[1e-10, 100]``.
+
+    This is the per-pillar kernel of :func:`bootstrap`, exposed so the error
+    classification can be tested directly:
+
+    * no sign change on the bracket -> ``ValueError`` "no admissible positive
+      discount factor — crossed/arbitrageable quotes";
+    * any other solver failure (non-finite residual, iteration budget) ->
+      ``ValueError`` "solver failed at pillar" carrying the solver message.
+    """
+    try:
+        return brentq(residual, _DF_LO, _DF_HI, xtol=1e-14)
+    except ValueError as exc:
+        msg = str(exc)
+        if "not bracketed" in msg:
+            raise ValueError(
+                f"bootstrap failed at pillar t={pillar} ({label}): no admissible "
+                f"positive discount factor in [{_DF_LO}, {_DF_HI}] — "
+                f"crossed/arbitrageable quotes? [{msg}]"
+            ) from exc
+        raise ValueError(
+            f"bootstrap: solver failed at pillar t={pillar} ({label}): {msg}"
+        ) from exc
+
+
 def bootstrap(instruments: Sequence[Instrument]) -> DiscountCurve:
     """Sequentially bootstrap a discount curve from sorted instruments.
 
     Instruments must be ordered with strictly increasing pillar times
     (duplicates rejected).  Each pillar DF is solved with Brent's method on
-    ``[1e-10, 100]`` (DF > 1 allowed: negative rates).  Raises
-    ``ValueError`` on ordering violations or when no positive DF can
-    reprice a quote (crossed/arbitrageable inputs).
+    ``[1e-10, 100]`` (DF > 1 allowed: negative rates) via
+    :func:`solve_pillar_df`.  Raises ``ValueError`` on ordering violations,
+    when no positive DF can reprice a quote (crossed/arbitrageable inputs,
+    message says so) or when the solver fails for any other reason (message
+    says "solver failed").
     """
     if len(instruments) == 0:
         raise ValueError("bootstrap needs at least one instrument")
@@ -216,15 +273,7 @@ def bootstrap(instruments: Sequence[Instrument]) -> DiscountCurve:
             trial = DiscountCurve(times + [_t], dfs + [x])
             return _ins.residual(trial)
 
-        try:
-            df = brentq(objective, _DF_LO, _DF_HI, xtol=1e-14)
-        except ValueError as exc:
-            raise ValueError(
-                f"bootstrap failed at pillar t={pillar} "
-                f"({type(ins).__name__}, rate={ins.rate}): no admissible "
-                f"positive discount factor — crossed/arbitrageable quotes? "
-                f"[{exc}]"
-            ) from exc
+        df = solve_pillar_df(objective, pillar, f"{type(ins).__name__}, rate={ins.rate}")
         times.append(pillar)
         dfs.append(df)
     return DiscountCurve(times, dfs)

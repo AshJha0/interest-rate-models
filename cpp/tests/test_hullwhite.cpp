@@ -5,12 +5,14 @@
 #include "irm/hullwhite.hpp"
 
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "irm/curve.hpp"
+#include "irm/mathutils.hpp"
 
 namespace {
 
@@ -163,6 +165,249 @@ TEST(HullWhite, JamshidianValidation) {
     EXPECT_THROW(hw.jamshidian_swaption(1.0, {}, 0.02), std::invalid_argument);
     EXPECT_THROW(hw.jamshidian_swaption(1.0, {0.5}, 0.02), std::invalid_argument);
     EXPECT_THROW(hw.jamshidian_swaption(1.0, {2.0, 2.0}, 0.02), std::invalid_argument);
+    EXPECT_THROW(hw.jamshidian_swaption(1.0, {2.0, INFINITY}, 0.02), std::invalid_argument);
+}
+
+// ---- validation of notional / strike / schedule (MAJOR-5) -----------------
+
+TEST(HullWhite, NonFiniteNotionalAndMcStrikeRejected) {
+    const irm::HullWhite hw(0.1, 0.01, market_curve());
+    const double nan = std::nan("");
+    const double inf = std::numeric_limits<double>::infinity();
+    EXPECT_THROW(hw.caplet(1.0, 2.0, 0.025, nan), std::invalid_argument);
+    EXPECT_THROW(hw.floorlet(1.0, 2.0, 0.025, inf), std::invalid_argument);
+    EXPECT_THROW(hw.cap({1.0, 2.0, 3.0}, 0.02, inf), std::invalid_argument);
+    EXPECT_THROW(hw.jamshidian_swaption(1.0, {2.0, 3.0}, 0.02, nan), std::invalid_argument);
+    EXPECT_THROW(hw.mc_caplet(1.0, 2.0, nan, 100.0, 8, 100, 1), std::invalid_argument);
+    EXPECT_THROW(hw.mc_caplet(1.0, 2.0, -1.5, 100.0, 8, 100, 1), std::invalid_argument);
+    EXPECT_THROW(hw.mc_caplet(1.0, 2.0, 0.02, inf, 8, 100, 1), std::invalid_argument);
+    EXPECT_THROW(hw.caplet(nan, 2.0, 0.02), std::invalid_argument);
+    EXPECT_THROW(hw.b_factor(nan, 5.0), std::invalid_argument);
+    EXPECT_THROW(hw.b_factor(-1.0, 5.0), std::invalid_argument);
+    EXPECT_THROW(hw.theta(1.0, 0.0), std::invalid_argument);
+    EXPECT_THROW(hw.zcb_price(1.0, 5.0, -1e6), std::invalid_argument);  // exp overflow
+    // A negative notional is a short position, not an error.
+    EXPECT_NEAR(hw.caplet(1.0, 2.0, 0.025, -100.0), -hw.caplet(1.0, 2.0, 0.025, 100.0), 1e-15);
+}
+
+TEST(HullWhite, CapScheduleNonIncreasingRejected) {
+    const irm::HullWhite hw(0.1, 0.01, market_curve());
+    EXPECT_THROW(hw.cap({1.0, 2.0, 2.0, 3.0}, 0.02), std::invalid_argument);
+    EXPECT_THROW(hw.cap({1.0, std::nan(""), 3.0}, 0.02), std::invalid_argument);
+    EXPECT_THROW(hw.cap({-1.0, 1.0}, 0.02), std::invalid_argument);
+    EXPECT_THROW(hw.cap({1.0, 2.0}, std::nan("")), std::invalid_argument);
+}
+
+// ---- Jamshidian contract (MAJOR-6, MINOR-4) ---------------------------------
+
+TEST(HullWhite, JamshidianResidualContractEnforced) {
+    const irm::HullWhite hw(0.1, 0.01, market_curve());
+    const std::vector<double> pays = {2.0, 3.0, 4.0, 5.0, 6.0};
+    const auto res = hw.jamshidian_swaption(1.0, pays, 0.028, 100.0);
+    const auto again = hw.jamshidian_at_r_star(1.0, pays, 0.028, res.r_star, 100.0);
+    EXPECT_NEAR(again.value, res.value, 1e-14);
+    EXPECT_EQ(again.residual, res.residual);
+    EXPECT_LT(std::fabs(again.residual), irm::kJamshidianResidualTol);
+    // A wrong r* violates |g(r*)| < 1e-10 -> domain_error.
+    EXPECT_THROW(hw.jamshidian_at_r_star(1.0, pays, 0.028, -1.0, 100.0), std::domain_error);
+    EXPECT_THROW(hw.jamshidian_at_r_star(1.0, pays, 0.028, res.r_star + 1e-6, 100.0),
+                 std::domain_error);
+    EXPECT_THROW(hw.jamshidian_at_r_star(1.0, pays, 0.028, std::nan("")), std::invalid_argument);
+    const auto rec = hw.jamshidian_at_r_star(1.0, pays, 0.028, res.r_star, 100.0, false);
+    EXPECT_NEAR(rec.value, hw.jamshidian_swaption(1.0, pays, 0.028, 100.0, false).value, 1e-14);
+}
+
+/// Payer swaption per unit notional by direct integration of the payoff
+/// (1 - g(r_T))^+ under the T-forward Gaussian law of r_T (Simpson from the
+/// payoff kink to mu + 12 sd) — independent of the decomposition.
+double swaption_by_integration(const irm::HullWhite& hw, double expiry,
+                               const std::vector<double>& pays, double x, int n = 2000) {
+    const irm::DiscountCurve& c = hw.curve();
+    const double v = hw.sigma() * hw.sigma() * (-std::expm1(-2.0 * hw.a() * expiry)) /
+                     (2.0 * hw.a());
+    const double b1 = hw.b_factor(expiry, pays[0]);
+    const double a1 = hw.a_factor(expiry, pays[0]);
+    const double mu = (std::log(a1 * c.df(expiry) / c.df(pays[0])) + b1 * b1 * v / 2.0) / b1;
+    std::vector<double> coupons;
+    double prev = expiry;
+    for (double t : pays) {
+        coupons.push_back(x * (t - prev));
+        prev = t;
+    }
+    coupons.back() += 1.0;
+    const double sd = std::sqrt(v);
+    const auto payoff = [&](double r) {
+        double g = 0.0;
+        for (std::size_t i = 0; i < pays.size(); ++i) g += coupons[i] * hw.zcb_price(expiry, pays[i], r);
+        return std::max(1.0 - g, 0.0);
+    };
+    double lo = mu - 12.0 * sd, hi = mu + 12.0 * sd;
+    while (lo < mu - 400.0 * sd || payoff(lo) > 0.0) lo -= 12.0 * sd;
+    for (int i = 0; i < 200; ++i) {
+        const double mid = 0.5 * (lo + hi);
+        if (payoff(mid) > 0.0) hi = mid; else lo = mid;
+    }
+    const double kink = hi, top = mu + 12.0 * sd;
+    const double h = (top - kink) / n;
+    double total = 0.0;
+    for (int i = 0; i <= n; ++i) {
+        const double r = kink + i * h;
+        const double w = std::exp(-0.5 * ((r - mu) / sd) * ((r - mu) / sd)) /
+                         (sd * std::sqrt(2.0 * M_PI));
+        const double coef = (i == 0 || i == n) ? 1.0 : ((i % 2 == 1) ? 4.0 : 2.0);
+        total += coef * payoff(r) * w;
+    }
+    return c.df(expiry) * total * h / 3.0;
+}
+
+TEST(HullWhite, JamshidianNegativeFixedRateStaysExact) {
+    // For X < 0 the coupon signs are (-, ..., -, +): g is not monotone but
+    // g - 1 still has a single crossing, so the decomposition is exact;
+    // 1 + X tau_n <= 0 is the genuinely degenerate case.
+    const irm::HullWhite hw(0.1, 0.01, market_curve());
+    const std::vector<double> pays = {2.0, 3.0, 4.0, 5.0, 6.0};
+    for (double x : {-0.005, -0.2, -0.5}) {
+        const auto res = hw.jamshidian_swaption(1.0, pays, x, 1.0);
+        EXPECT_GT(res.value, 0.0);
+        EXPECT_LT(std::fabs(res.residual), 1e-10);
+        EXPECT_NEAR(res.value / swaption_by_integration(hw, 1.0, pays, x), 1.0, 1e-9) << "X=" << x;
+    }
+    EXPECT_LT(hw.jamshidian_swaption(1.0, pays, -0.005).r_star, 0.0);
+    EXPECT_THROW(hw.jamshidian_swaption(1.0, pays, -1.0), std::invalid_argument);
+    EXPECT_THROW(hw.jamshidian_swaption(1.0, pays, -1.5), std::invalid_argument);
+    const auto ok = hw.jamshidian_swaption(1.0, pays, -0.8);
+    EXPECT_LT(std::fabs(ok.residual), 1e-10);
+    // Beyond about -0.95 the coupon-bond terms are O(1e8+) and |g(r*)| cannot
+    // beat 1e-10 in double precision: the contract rejects it honestly.
+    EXPECT_THROW(hw.jamshidian_swaption(1.0, pays, -0.99), std::domain_error);
+    // Positive fixed rate agrees with integration too.
+    const auto pos = hw.jamshidian_swaption(1.0, pays, 0.028);
+    EXPECT_NEAR(pos.value / swaption_by_integration(hw, 1.0, pays, 0.028), 1.0, 1e-9);
+}
+
+// ---- Monte Carlo determinism / small mean reversion --------------------------
+
+TEST(HullWhite, McCapletSameSeedAndSinglePath) {
+    const irm::HullWhite hw(0.1, 0.01, market_curve());
+    const auto a = hw.mc_caplet(1.0, 2.0, 0.025, 100.0, 4, 500, 3);
+    const auto b = hw.mc_caplet(1.0, 2.0, 0.025, 100.0, 4, 500, 3);
+    const auto c = hw.mc_caplet(1.0, 2.0, 0.025, 100.0, 4, 500, 4);
+    EXPECT_EQ(a.first, b.first);
+    EXPECT_EQ(a.second, b.second);
+    EXPECT_NE(a.first, c.first);
+    const auto single = hw.mc_caplet(1.0, 2.0, 0.02, 100.0, 1, 1, 1);
+    EXPECT_TRUE(std::isfinite(single.first));
+    EXPECT_GE(single.first, 0.0);
+    EXPECT_EQ(single.second, 0.0);
+}
+
+TEST(HullWhite, McCapletTinyMeanReversionUnbiased) {
+    // a*dt = 5e-7 per step exercises the series branch of var_i and V(t).
+    const irm::HullWhite slow(1e-4, 0.01, market_curve());
+    const double analytic = slow.caplet(1.0, 2.0, 0.025, 100.0);
+    const auto [price, se] = slow.mc_caplet(1.0, 2.0, 0.025, 100.0, 200, 20000, 9);
+    EXPECT_NEAR(price, analytic, 3.0 * se);
+}
+
+TEST(HullWhite, VarianceIntegralUsesCancellationFreeKernel) {
+    const irm::HullWhite slow(1e-5, 0.02, market_curve());
+    EXPECT_NEAR(slow.variance_integral(1.0), 0.5 * irm::ou_integral_variance(1e-5, 0.02, 1.0),
+                1e-20);
+    EXPECT_NEAR(slow.variance_integral(1.0) / (0.02 * 0.02 / 6.0), 1.0, 1e-5);
+    EXPECT_EQ(slow.variance_integral(0.0), 0.0);
+}
+
+// ---- calibration of (a, sigma) (MAJOR-7) --------------------------------------
+
+void make_quotes(const irm::HullWhite& truth, std::vector<irm::CapletQuote>& caps,
+                 std::vector<irm::SwaptionQuote>& swps) {
+    for (double r : {1.0, 2.0, 4.0}) {
+        caps.emplace_back(r, r + 1.0, 0.025, truth.caplet(r, r + 1.0, 0.025, 1.0));
+    }
+    const std::vector<double> pays = {2.0, 3.0, 4.0, 5.0, 6.0};
+    swps.emplace_back(1.0, pays, 0.028, truth.jamshidian_swaption(1.0, pays, 0.028, 1.0).value);
+}
+
+TEST(HullWhiteCalibration, RecoversAAndSigma) {
+    const irm::HullWhite truth(0.08, 0.012, market_curve());
+    std::vector<irm::CapletQuote> caps;
+    std::vector<irm::SwaptionQuote> swps;
+    make_quotes(truth, caps, swps);
+    const auto cal = irm::calibrate_hullwhite(market_curve(), caps, swps);
+    EXPECT_TRUE(cal.converged);
+    EXPECT_TRUE(cal.identified);
+    EXPECT_FALSE(cal.at_bound);
+    EXPECT_FALSE(cal.a_fixed);
+    EXPECT_EQ(cal.n_starts, 3);
+    EXPECT_NEAR(cal.a, 0.08, 1e-8);
+    EXPECT_NEAR(cal.sigma, 0.012, 1e-9);
+    EXPECT_LT(cal.rmse, 1e-10);
+    const irm::HullWhite model = cal.model(market_curve());
+    for (const auto& q : caps) {
+        EXPECT_NEAR(model.caplet(q.reset, q.pay, q.strike, 1.0), q.price, 1e-10);
+    }
+}
+
+TEST(HullWhiteCalibration, AFixedAndWarmStart) {
+    const irm::HullWhite truth(0.08, 0.012, market_curve());
+    std::vector<irm::CapletQuote> caps;
+    std::vector<irm::SwaptionQuote> swps;
+    make_quotes(truth, caps, swps);
+    const auto cal = irm::calibrate_hullwhite(market_curve(), caps, swps, 0.08);
+    EXPECT_TRUE(cal.a_fixed);
+    EXPECT_EQ(cal.a, 0.08);
+    EXPECT_TRUE(cal.converged);
+    EXPECT_TRUE(cal.identified);
+    EXPECT_NEAR(cal.sigma, 0.012, 1e-9);
+    const auto warm = irm::calibrate_hullwhite(market_curve(), caps, swps, std::nullopt,
+                                               std::vector<double>{0.2, 0.02});
+    EXPECT_EQ(warm.n_starts, 1);
+    EXPECT_FALSE(warm.identified);
+    EXPECT_TRUE(warm.converged);
+    EXPECT_NEAR(warm.a, 0.08, 1e-6);
+    EXPECT_NEAR(warm.sigma, 0.012, 1e-8);
+    const auto only_caps = irm::calibrate_hullwhite(market_curve(), caps);
+    EXPECT_NEAR(only_caps.sigma, 0.012, 1e-8);
+    const auto only_swp = irm::calibrate_hullwhite(market_curve(), {}, swps, 0.08);
+    EXPECT_NEAR(only_swp.sigma, 0.012, 1e-8);
+}
+
+TEST(HullWhiteCalibration, SingleQuoteNotIdentified) {
+    const irm::HullWhite truth(0.08, 0.012, market_curve());
+    std::vector<irm::CapletQuote> caps;
+    std::vector<irm::SwaptionQuote> swps;
+    make_quotes(truth, caps, swps);
+    caps.erase(caps.begin() + 1, caps.end());
+    const auto cal = irm::calibrate_hullwhite(market_curve(), caps);
+    EXPECT_TRUE(cal.converged);
+    EXPECT_FALSE(cal.identified);  // one price, two parameters: a ridge
+    EXPECT_GT(cal.a_spread, 1e-2);
+    EXPECT_LT(cal.rmse, 1e-9);
+}
+
+TEST(HullWhiteCalibration, NonConvergenceAndValidation) {
+    const irm::HullWhite truth(0.08, 0.012, market_curve());
+    std::vector<irm::CapletQuote> caps;
+    std::vector<irm::SwaptionQuote> swps;
+    make_quotes(truth, caps, swps);
+    const auto res = irm::calibrate_hullwhite(market_curve(), caps, swps, std::nullopt,
+                                              std::nullopt, /*maxiter=*/2);
+    EXPECT_FALSE(res.converged);
+    EXPECT_TRUE(std::isfinite(res.rmse));
+    EXPECT_THROW(irm::calibrate_hullwhite(market_curve(), {}), std::invalid_argument);
+    EXPECT_THROW(irm::calibrate_hullwhite(market_curve(), caps, swps, 0.0), std::invalid_argument);
+    EXPECT_THROW(irm::calibrate_hullwhite(market_curve(), caps, swps, std::nullopt,
+                                          std::vector<double>{0.1}),
+                 std::invalid_argument);
+    EXPECT_THROW(irm::calibrate_hullwhite(market_curve(), caps, swps, std::nullopt,
+                                          std::vector<double>{std::nan(""), 0.01}),
+                 std::invalid_argument);
+    EXPECT_THROW(irm::CapletQuote(1.0, 2.0, 0.02, std::nan("")), std::invalid_argument);
+    EXPECT_THROW(irm::CapletQuote(2.0, 1.0, 0.02, 0.001), std::invalid_argument);
+    EXPECT_THROW(irm::CapletQuote(1.0, 2.0, 0.02, -0.001), std::invalid_argument);
+    EXPECT_THROW(irm::SwaptionQuote(1.0, {0.5, 2.0}, 0.02, 0.001), std::invalid_argument);
+    EXPECT_THROW(irm::SwaptionQuote(1.0, {}, 0.02, 0.001), std::invalid_argument);
+    EXPECT_THROW(irm::SwaptionQuote(INFINITY, {2.0}, 0.02, 0.001), std::invalid_argument);
 }
 
 TEST(HullWhite, McCapletWithin3StandardErrors) {

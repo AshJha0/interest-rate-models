@@ -1,4 +1,4 @@
-//! # `irm` — interest rate models (P04 Rust port)
+//! # `irm` — interest rate models (Rust port)
 //!
 //! Curve bootstrapping (deposits / FRAs / par swaps / OIS), the Vasicek
 //! short-rate model and the Hull-White one-factor model, ported from the
@@ -14,7 +14,11 @@
 //!   that `r < 0` works.
 //! * Invalid input returns `Err(IrmError)` — no panics; calibration
 //!   non-convergence is reported via a `converged` flag, never an error.
+//! * Calibrations (`calibrate_vasicek`, `calibrate_hullwhite`) run from
+//!   several starts and report `at_bound` / `identified` diagnostics;
+//!   `bachelier` converts option prices to normal (bp) implied vols.
 
+pub mod bachelier;
 pub mod bootstrap;
 pub mod curve;
 pub mod error;
@@ -25,11 +29,15 @@ pub mod quotes;
 pub mod rootfind;
 pub mod vasicek;
 
-pub use bootstrap::{annual_schedule, bootstrap, Instrument};
+pub use bachelier::{bachelier_implied_vol, bachelier_price};
+pub use bootstrap::{annual_schedule, bootstrap, solve_pillar_df, Instrument, MAX_MATURITY, MIN_MATURITY};
 pub use curve::{par_swap_rate, DiscountCurve};
 pub use error::{IrmError, Result};
-pub use hullwhite::{HullWhite, JamshidianResult, FD_STEP};
-pub use mathutils::{erfc, norm_cdf, ou_step_moments, OuStepMoments};
+pub use hullwhite::{
+    calibrate_hullwhite, CapletQuote, HullWhite, HullWhiteCalibration, JamshidianResult,
+    SwaptionQuote, FD_STEP, JAMSHIDIAN_RESIDUAL_TOL,
+};
+pub use mathutils::{erfc, norm_cdf, norm_pdf, ou_integral_variance, ou_step_moments, OuStepMoments};
 pub use optimize::{nelder_mead, NelderMeadResult};
 pub use quotes::{load_curve_quotes, load_ois_quotes, load_zero_yields};
 pub use rootfind::{bisect, brentq, BRENT_MAXITER, BRENT_RTOL, BRENT_XTOL};

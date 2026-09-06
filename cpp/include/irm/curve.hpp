@@ -52,6 +52,8 @@ public:
 
     /// Simply compounded forward rate over `[t1, t2]`:
     /// `F(t1, t2) = (DF(t1)/DF(t2) - 1) / (t2 - t1)`; requires 0 <= t1 < t2.
+    /// \throws std::invalid_argument if the result is not representable
+    ///   (DF(t2) underflowed to 0 or the ratio overflowed) — never returns inf.
     double fwd_rate(double t1, double t2) const;
 
     /// Pillar times (without the implicit t = 0 node).

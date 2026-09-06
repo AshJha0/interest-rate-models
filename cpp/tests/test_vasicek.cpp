@@ -4,6 +4,7 @@
 #include "irm/vasicek.hpp"
 
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -110,22 +111,96 @@ TEST(VasicekCalibration, RecoversCleanParameters) {
     }
     const auto cal = irm::calibrate_vasicek(ts, ys, 0.03);
     EXPECT_TRUE(cal.converged);
+    EXPECT_FALSE(cal.at_bound);
+    EXPECT_EQ(cal.n_starts, 3);
+    EXPECT_FALSE(cal.sigma_fixed);
     EXPECT_NEAR(cal.kappa, 0.8, 1e-3);
     EXPECT_NEAR(cal.theta, 0.05, 1e-4);
     EXPECT_NEAR(cal.sigma, 0.02, 1e-3);
     EXPECT_LT(cal.rmse, 1e-8);
 }
 
-TEST(VasicekCalibration, FitsBundledNoisyYields) {
+TEST(VasicekCalibration, MultistartReportsNonIdentifiability) {
+    // The bundled noisy yields have two least-squares minima with rmse within
+    // 2 % of each other, at (0.80, 0.050, 0.023) and (0.41, 0.069, 0.080):
+    // the diagnostics must say so instead of claiming a unique fit.
     const auto [ts, ys] = irm::load_zero_yields(kDataDir + "/zero_yields.csv");
     const auto cal = irm::calibrate_vasicek(ts, ys, 0.03);
     EXPECT_TRUE(cal.converged);
-    // Noise is N(0, 2e-5); the fit should be at that scale.
-    EXPECT_LT(cal.rmse, 1e-4);
-    EXPECT_NEAR(cal.kappa, 0.8, 0.2);
-    EXPECT_NEAR(cal.theta, 0.05, 0.01);
-    EXPECT_GE(cal.sigma, 0.0);
+    EXPECT_FALSE(cal.at_bound);
+    EXPECT_LT(cal.rmse, 2e-5);
+    EXPECT_EQ(cal.n_starts, 3);
+    EXPECT_FALSE(cal.identified);
+    EXPECT_GT(cal.sigma_spread, 0.01);
+    EXPECT_GT(cal.kappa_spread, 0.1);
+    EXPECT_GE(cal.theta, 0.04);
+    EXPECT_LE(cal.theta, 0.07);
     EXPECT_NO_THROW(cal.model());
+    // Two warm starts land on the two minima with equivalent rmse.
+    double mean_y = 0.0;
+    for (double y : ys) mean_y += y;
+    mean_y /= static_cast<double>(ys.size());
+    const auto a = irm::calibrate_vasicek(ts, ys, 0.03, std::vector<double>{0.5, mean_y, 0.01});
+    const auto b = irm::calibrate_vasicek(ts, ys, 0.03, std::vector<double>{0.5, 0.05, 0.05});
+    EXPECT_EQ(a.n_starts, 1);
+    EXPECT_LT(a.rmse, 2e-5);
+    EXPECT_LT(b.rmse, 2e-5);
+    EXPECT_LT(std::fabs(a.rmse - b.rmse), 5e-6);
+    EXPECT_GT(std::fabs(a.sigma - b.sigma), 0.01);
+    EXPECT_FALSE(a.identified);  // single start: identifiability not assessed
+}
+
+TEST(VasicekCalibration, SigmaFixedIdentifiesKappaTheta) {
+    const auto [ts, ys] = irm::load_zero_yields(kDataDir + "/zero_yields.csv");
+    const auto cal = irm::calibrate_vasicek(ts, ys, 0.03, std::nullopt, 4000, 0.02);
+    EXPECT_TRUE(cal.sigma_fixed);
+    EXPECT_EQ(cal.sigma, 0.02);
+    EXPECT_TRUE(cal.converged);
+    EXPECT_TRUE(cal.identified);
+    EXPECT_FALSE(cal.at_bound);
+    EXPECT_NEAR(cal.kappa, 0.8002161, 1e-6);
+    EXPECT_NEAR(cal.theta, 0.0499880, 1e-6);
+    EXPECT_LT(cal.kappa_spread, 1e-6);
+    EXPECT_EQ(cal.sigma_spread, 0.0);
+    // sigma_fixed with a warm start ignores x0[2].
+    const auto warm =
+        irm::calibrate_vasicek(ts, ys, 0.03, std::vector<double>{0.3, 0.04, 99.0}, 4000, 0.02);
+    EXPECT_NEAR(warm.kappa, cal.kappa, 1e-6);
+    EXPECT_EQ(warm.sigma, 0.02);
+    EXPECT_THROW(irm::calibrate_vasicek(ts, ys, 0.03, std::nullopt, 4000, -0.01),
+                 std::invalid_argument);
+}
+
+TEST(VasicekCalibration, PenaltyStartNotReportedConverged) {
+    const auto [ts, ys] = irm::load_zero_yields(kDataDir + "/zero_yields.csv");
+    const auto cal = irm::calibrate_vasicek(ts, ys, 0.03, std::vector<double>{-1.0, 0.0, -1.0});
+    EXPECT_TRUE(cal.at_bound);
+    EXPECT_FALSE(cal.converged);  // stopped at the penalty wall
+    EXPECT_LE(cal.kappa, 1e-5);
+    EXPECT_TRUE(std::isfinite(cal.rmse));
+}
+
+TEST(VasicekCalibration, FlatYieldsSigmaAtZeroBound) {
+    // Flat yields equal to r0 are fitted exactly by sigma = 0, theta = r0 for
+    // any kappa: sigma sits on its bound and kappa is not identified.
+    const std::vector<double> ts = {1.0, 2.0, 3.0, 5.0, 10.0};
+    const std::vector<double> ys(5, 0.03);
+    const auto cal = irm::calibrate_vasicek(ts, ys, 0.03);
+    EXPECT_TRUE(cal.at_bound);
+    EXPECT_FALSE(cal.converged);
+    EXPECT_LT(cal.sigma, 1e-5);
+    EXPECT_NEAR(cal.theta, 0.03, 1e-8);
+    EXPECT_FALSE(cal.identified);
+}
+
+TEST(VasicekCalibration, NonConvergenceReportedNotThrown) {
+    const irm::Vasicek truth(0.8, 0.05, 0.02, 0.03);
+    std::vector<double> ts = {1.0, 2.0, 5.0, 10.0}, ys;
+    for (double t : ts) ys.push_back(truth.zero_yield(t));
+    const auto cal = irm::calibrate_vasicek(ts, ys, 0.03, std::nullopt, /*maxiter=*/2);
+    EXPECT_FALSE(cal.converged);
+    EXPECT_EQ(cal.iterations, 2);
+    EXPECT_TRUE(std::isfinite(cal.rmse));
 }
 
 TEST(VasicekCalibration, InputValidation) {
@@ -137,6 +212,57 @@ TEST(VasicekCalibration, InputValidation) {
                  std::invalid_argument);
     EXPECT_THROW(irm::calibrate_vasicek({1.0, 2.0, 3.0}, {0.03, std::nan(""), 0.05}, 0.03),
                  std::invalid_argument);
+    EXPECT_THROW(irm::calibrate_vasicek({1.0, 2.0, 3.0}, {0.03, 0.04, 0.05},
+                                        std::numeric_limits<double>::infinity()),
+                 std::invalid_argument);
+    EXPECT_THROW(irm::calibrate_vasicek({1.0, 2.0, 3.0}, {0.03, 0.04, 0.05}, 0.03, std::nullopt,
+                                        /*maxiter=*/0),
+                 std::invalid_argument);
+}
+
+TEST(VasicekCalibration, X0WrongLengthOrNonFiniteRejected) {
+    const std::vector<double> ts = {1.0, 2.0, 3.0}, ys = {0.02, 0.021, 0.022};
+    // A 2-entry x0 used to read p[2] past the end (undefined behaviour).
+    EXPECT_THROW(irm::calibrate_vasicek(ts, ys, 0.02, std::vector<double>{0.5, 0.03}),
+                 std::invalid_argument);
+    EXPECT_THROW(irm::calibrate_vasicek(ts, ys, 0.02, std::vector<double>{0.5, 0.03, 0.01, 0.0}),
+                 std::invalid_argument);
+    EXPECT_THROW(irm::calibrate_vasicek(ts, ys, 0.02, std::vector<double>{0.5, std::nan(""), 0.01}),
+                 std::invalid_argument);
+}
+
+TEST(Vasicek, McZcbManySmallStepsUnbiased) {
+    // kappa*dt = 2.5e-6 per step: the naive var_i would be wrong by orders of
+    // magnitude; with the series the estimator stays unbiased.
+    const irm::Vasicek m(1e-3, 0.03, 0.01, 0.02);
+    const double analytic = m.zcb_price(5.0);
+    const auto [price, se] = m.mc_zcb(5.0, /*n_steps=*/2000, /*n_paths=*/10000, /*seed=*/77);
+    EXPECT_GT(se, 0.0);
+    EXPECT_NEAR(price, analytic, 3.0 * se);
+}
+
+TEST(Vasicek, SameSeedSameResultAndSinglePath) {
+    const irm::Vasicek m(0.5, 0.03, 0.01, 0.02);
+    const auto a = m.mc_zcb(3.0, 4, 2000, 11);
+    const auto b = m.mc_zcb(3.0, 4, 2000, 11);
+    const auto c = m.mc_zcb(3.0, 4, 2000, 12);
+    EXPECT_EQ(a.first, b.first);
+    EXPECT_EQ(a.second, b.second);
+    EXPECT_NE(a.first, c.first);
+    const auto single = m.mc_zcb(1.0, 1, 1, 5);
+    EXPECT_TRUE(std::isfinite(single.first));
+    EXPECT_GT(single.first, 0.0);
+    EXPECT_EQ(single.second, 0.0);
+}
+
+TEST(Vasicek, NonFiniteAndOverflowRejected) {
+    const irm::Vasicek m(0.5, 0.03, 0.01, 0.02);
+    EXPECT_THROW(m.zcb_price(std::nan("")), std::invalid_argument);
+    EXPECT_THROW(m.zcb_price(5.0, 0.0, std::numeric_limits<double>::infinity()),
+                 std::invalid_argument);
+    EXPECT_THROW(m.r_mean(1.0, std::nan("")), std::invalid_argument);
+    EXPECT_THROW(m.zero_yield(std::numeric_limits<double>::infinity()), std::invalid_argument);
+    EXPECT_THROW(m.zcb_price(5.0, 0.0, -1e6), std::invalid_argument);  // exp overflow
 }
 
 }  // namespace

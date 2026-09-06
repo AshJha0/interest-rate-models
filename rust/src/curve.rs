@@ -159,7 +159,9 @@ impl DiscountCurve {
     }
 
     /// Simply compounded forward rate over `[t1, t2]`:
-    /// `F(t1, t2) = (DF(t1)/DF(t2) - 1) / (t2 - t1)`.
+    /// `F(t1, t2) = (DF(t1)/DF(t2) - 1) / (t2 - t1)`.  A result that is not
+    /// representable (DF(t2) underflowed to 0, ratio overflowed) is an
+    /// `InvalidInput` error — never `inf`.
     pub fn fwd_rate(&self, t1: f64, t2: f64) -> Result<f64> {
         if !t1.is_finite() || !t2.is_finite() {
             return Err(IrmError::InvalidInput(
@@ -171,7 +173,20 @@ impl DiscountCurve {
                 "need 0 <= t1 < t2 for a forward rate, got t1={t1}, t2={t2}"
             )));
         }
-        Ok((self.df(t1)? / self.df(t2)? - 1.0) / (t2 - t1))
+        let df1 = self.df(t1)?;
+        let df2 = self.df(t2)?;
+        if df2 == 0.0 {
+            return Err(IrmError::InvalidInput(format!(
+                "forward rate over [{t1}, {t2}] not representable: DF(t2) underflowed to 0"
+            )));
+        }
+        let fwd = (df1 / df2 - 1.0) / (t2 - t1);
+        if !fwd.is_finite() {
+            return Err(IrmError::InvalidInput(format!(
+                "forward rate over [{t1}, {t2}] not representable: {fwd}"
+            )));
+        }
+        Ok(fwd)
     }
 }
 

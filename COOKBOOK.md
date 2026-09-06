@@ -6,10 +6,11 @@ from the `python/` directory with `PYTHONPATH=src python3 <file>.py`
 snippets follow the `API_SPEC.md` contract: C++ uses namespace `irm`
 (snake_case, exceptions), Rust the `irm` crate (snake_case,
 `Result<_, IrmError>` — snippets use `?` inside a function returning
-`Result`), Java package `com.quant.irm` (camelCase methods,
+`Result<(), IrmError>`), Java package `com.quant.irm` (camelCase methods,
 `IllegalArgumentException`). C++ snippets show per-module headers under
-`include/irm/`; adjust to your build if the port bundles an umbrella
-header.
+`include/irm/` (`irm/irm.hpp` is the umbrella header). Every C++, Rust and
+Java snippet below is extracted and compiled against the real library as
+part of the repository's verification (see docs/ARCHITECTURE.md §7).
 
 Numbers in the comments are golden values from
 `data/golden/golden.json`, so you can eyeball correctness immediately.
@@ -152,8 +153,9 @@ double df10 = eur.df(10.0);              // 0.9217932521073945
 
 ```rust
 use irm::{bootstrap, load_curve_quotes, load_ois_quotes};
-let eur = bootstrap(&load_curve_quotes("../data/curve_quotes.csv", "EUR")?)?;
-let ois = bootstrap(&load_ois_quotes("../data/ois_quotes.csv")?)?;
+use std::path::Path;
+let eur = bootstrap(&load_curve_quotes(Path::new("../data/curve_quotes.csv"), "EUR")?)?;
+let ois = bootstrap(&load_ois_quotes(Path::new("../data/ois_quotes.csv"))?)?;
 let df10 = eur.df(10.0)?;                // 0.9217932521073945
 ```
 
@@ -161,8 +163,10 @@ let df10 = eur.df(10.0)?;                // 0.9217932521073945
 
 ```java
 import com.quant.irm.*;
-DiscountCurve eur = Bootstrap.bootstrap(Quotes.loadCurveQuotes("../data/curve_quotes.csv", "EUR"));
-DiscountCurve ois = Bootstrap.bootstrap(Quotes.loadOisQuotes("../data/ois_quotes.csv"));
+import java.nio.file.Paths;
+DiscountCurve eur = Bootstrap.bootstrap(
+    Quotes.loadCurveQuotes(Paths.get("../data/curve_quotes.csv"), "EUR"));
+DiscountCurve ois = Bootstrap.bootstrap(Quotes.loadOisQuotes(Paths.get("../data/ois_quotes.csv")));
 double df10 = eur.df(10.0);              // 0.9217932521073945
 ```
 
@@ -175,9 +179,12 @@ daily compounding is approximated as continuous (gap `O(r^2/365)`).
 ## 4. How do I detect crossed / arbitrageable quotes?
 
 Bad quotes fail in one of two places: at instrument construction (the
-quote *alone* implies `DF <= 0`) or at solve time (no positive DF can
-reprice it against its neighbors). Both raise the language's standard
-error naming the problem.
+quote *alone* implies `DF <= 0`, or the maturity is outside `[1e-6, 200]`
+years) or at solve time (no positive DF can reprice it against its
+neighbors). Both raise the language's standard error naming the problem.
+A solver failure that is *not* a bracketing failure (a NaN residual, an
+exhausted iteration budget) is reported as "solver failed at pillar" —
+never relabelled as crossed quotes.
 
 **Python**
 
@@ -201,22 +208,41 @@ except ValueError as e:
 ```
 
 **C++** — `std::invalid_argument` (construction/ordering) or
-`std::domain_error` (no admissible DF); **Rust** —
-`Err(IrmError::InvalidInput(..))` / `Err(IrmError::Bracket(..))`;
-**Java** — `IllegalArgumentException`. Same three failure sites in every
-port:
+`std::domain_error` (no admissible DF / solver failure); **Rust** —
+`Err(IrmError::InvalidInput(..))` at construction and
+`Err(IrmError::Bootstrap(..))` at solve time (the message says "crossed"
+or "solver failed"); **Java** — `IllegalArgumentException`. Same three
+failure sites in every port:
+
+```cpp
+#include "irm/bootstrap.hpp"
+try {
+    irm::bootstrap({irm::Swap{1.0, 0.02}, irm::Swap{2.0, 5.0}});
+} catch (const std::domain_error& e) {
+    std::puts(e.what());                     // names pillar t=2.0, says "crossed"
+}
+```
 
 ```rust
-use irm::{bootstrap, Instrument};
+use irm::{bootstrap, Instrument, IrmError};
 match Instrument::deposit(10.0, -0.15) {
-    Err(e) => eprintln!("construction: {e}"),   // non-positive implied DF
-    Ok(_) => unreachable!(),
+    Err(IrmError::InvalidInput(msg)) => eprintln!("construction: {msg}"),
+    other => panic!("unexpected {other:?}"),
+}
+let crossed = [Instrument::swap(1.0, 0.02)?, Instrument::swap(2.0, 5.0)?];
+match bootstrap(&crossed) {
+    Err(IrmError::Bootstrap(msg)) => eprintln!("solve: {msg}"),   // "crossed/arbitrageable"
+    other => panic!("unexpected {other:?}"),
 }
 ```
 
 ```java
+import com.quant.irm.*;
+import java.util.List;
 try { Bootstrap.bootstrap(List.of(new Swap(1.0, 0.02), new Swap(2.0, 5.0))); }
 catch (IllegalArgumentException e) { System.out.println("solve: " + e.getMessage()); }
+try { new Swap(1e12, 0.03); }                            // days typed as years
+catch (IllegalArgumentException e) { System.out.println("construction: " + e.getMessage()); }
 ```
 
 ---
@@ -253,8 +279,8 @@ double vr = v.r_var(2.0);                // 8.646647167633873e-05
 ```rust
 use irm::Vasicek;
 let v = Vasicek::new(0.5, 0.03, 0.01, 0.02)?;
-let p  = v.zcb_price(5.0)?;              // 0.8770621876849438
-let m  = v.r_mean(2.0)?;
+let p  = v.zcb_price(5.0, 0.0, None)?;   // 0.8770621876849438  (maturity, t, r: None = r0)
+let m  = v.r_mean(2.0, None)?;           // 0.026321205588285577
 let vr = v.r_var(2.0)?;
 ```
 
@@ -316,7 +342,12 @@ intrinsic on the forward bond, `max(P(0,S) - K*P(0,T), 0)` — no 0/0.
 
 ---
 
-## 7. How do I calibrate Vasicek to market zero yields?
+## 7. How do I calibrate Vasicek to market zero yields — and read the diagnostics?
+
+The fit runs from three starts and reports whether they agree. On the
+bundled data they do **not**: two minima fit within 2 % of each other in
+rmse, so yields alone do not identify `(kappa, theta, sigma)`. Fix
+`sigma` from option prices and the fit is unique.
 
 **Python**
 
@@ -325,31 +356,45 @@ from irm import calibrate_vasicek, load_zero_yields
 
 ts, ys = load_zero_yields("../data/zero_yields.csv")
 cal = calibrate_vasicek(ts, ys, r0=0.03)
-print(cal.kappa, cal.theta, cal.sigma)   # ~0.7977, ~0.0501, ~0.0225
-print(cal.rmse, cal.converged)           # ~1.7e-05, True
+print(cal.kappa, cal.theta, cal.sigma)   # 0.4114, 0.0688, 0.0805 (best of 3 starts)
+print(cal.rmse, cal.converged, cal.at_bound)   # 1.70e-05, True, False
+print(cal.identified, cal.sigma_spread)  # False, 0.058 -> yields do not pin sigma
+
+cal = calibrate_vasicek(ts, ys, r0=0.03, sigma_fixed=0.02)   # sigma from options
+print(cal.kappa, cal.theta, cal.identified)   # 0.8002, 0.0500, True
 model = cal.model()                      # a Vasicek you can price with
 print(model.zero_yield(10.0))
+
+warm = calibrate_vasicek(ts, ys, r0=0.03, x0=(0.8, 0.05, 0.02))   # single warm start
+assert warm.n_starts == 1 and not warm.identified    # identifiability not assessed
 ```
 
-Non-convergence is *reported* (`converged=False`), never raised — always
-check the flag and the RMSE before trusting the parameters.
+Non-convergence is *reported* (`converged=False`), never raised; a
+solution on the domain wall sets `at_bound=True` and `converged=False`.
+Price on a calibration only if `converged and (identified or sigma_fixed)`.
 
 **C++**
 
 ```cpp
+#include "irm/quotes.hpp"
 #include "irm/vasicek.hpp"
 auto [ts, ys] = irm::load_zero_yields("../data/zero_yields.csv");
 irm::VasicekCalibration cal = irm::calibrate_vasicek(ts, ys, /*r0=*/0.03);
-if (!cal.converged) { /* report, do not price */ }
-irm::Vasicek model(cal.kappa, cal.theta, cal.sigma, cal.r0);
+if (!cal.converged || !cal.identified) { /* report: on the bundled data identified == false */ }
+cal = irm::calibrate_vasicek(ts, ys, 0.03, std::nullopt, 4000, /*sigma_fixed=*/0.02);
+irm::Vasicek model = cal.model();         // kappa 0.8002, theta 0.0500, identified
 ```
 
 **Rust**
 
 ```rust
-let (ts, ys) = irm::load_zero_yields("../data/zero_yields.csv")?;
-let cal = irm::calibrate_vasicek(&ts, &ys, 0.03, None, 4000)?; // Err only on bad input
-assert!(cal.converged);
+use irm::{calibrate_vasicek, load_zero_yields};
+use std::path::Path;
+let (ts, ys) = load_zero_yields(Path::new("../data/zero_yields.csv"))?;
+let cal = calibrate_vasicek(&ts, &ys, 0.03, None, 4000, None)?; // Err only on bad input
+assert!(cal.converged && !cal.identified);                     // bundled data: not identified
+let cal = calibrate_vasicek(&ts, &ys, 0.03, None, 4000, Some(0.02))?;
+assert!(cal.converged && cal.identified);
 let model = cal.model()?;
 ```
 
@@ -357,9 +402,11 @@ let model = cal.model()?;
 
 ```java
 import com.quant.irm.*;
-double[][] data = Quotes.loadZeroYields("../data/zero_yields.csv");
-VasicekCalibration cal = Vasicek.calibrate(data[0], data[1], 0.03);
-if (!cal.converged) { /* report */ }
+import java.nio.file.Paths;
+double[][] data = Quotes.loadZeroYields(Paths.get("../data/zero_yields.csv"));
+Vasicek.Calibration cal = Vasicek.calibrate(data[0], data[1], 0.03);
+if (!cal.converged() || !cal.identified()) { /* report */ }
+cal = Vasicek.calibrate(data[0], data[1], 0.03, null, 4000, 0.02);   // sigma fixed
 Vasicek model = cal.model();
 ```
 
@@ -399,18 +446,22 @@ auto [price, se] = v.mc_zcb(5.0, /*n_steps=*/8, /*n_paths=*/50000, /*seed=*/42);
 ```rust
 let v = irm::Vasicek::new(0.5, 0.03, 0.01, 0.02)?;
 let (price, se) = v.mc_zcb(5.0, 8, 50_000, 42)?;
-assert!((price - v.zcb_price(5.0)?).abs() < 3.0 * se);
+assert!((price - v.zcb_price(5.0, 0.0, None)?).abs() < 3.0 * se);
 ```
 
 **Java**
 
 ```java
 Vasicek v = new Vasicek(0.5, 0.03, 0.01, 0.02);
-double[] mc = v.mcZcb(5.0, 8, 50000, 42);   // {price, standardError}
+McEstimate mc = v.mcZcb(5.0, 8, 50000, 42L);   // mc.price(), mc.standardError()
 ```
 
 Seeds fix a language's own stream, not cross-language equality — ports
-agree *statistically* (golden bands are 6 SE), not path-by-path.
+agree *statistically* (golden bands are 6 SE), not path-by-path. A seed
+reproduces a stream only for a pinned toolchain and dependency set:
+libstdc++'s `std::normal_distribution`, Rust's `StdRng` (explicitly not
+stable across `rand` versions) and `java.util.Random` all differ, so do
+not archive seeds as if they were results.
 
 ---
 
@@ -450,7 +501,7 @@ double p0 = hw.zcb_price(0.0, 5.0);      // == mkt.df(5.0) to 1e-12 (golden hw_z
 let mkt = irm::DiscountCurve::new(&[1.0,2.0,3.0,5.0,10.0],
     &[0.9787294774691476, 0.9550419621907147, 0.9291361457915193,
       0.8715343499971578, 0.7046880897187134])?;
-let hw = irm::HullWhite::new(0.1, 0.01, &mkt)?;
+let hw = irm::HullWhite::new(0.1, 0.01, mkt.clone())?;   // takes the curve by value
 let p0 = hw.zcb_price(0.0, 5.0, None)?;  // == mkt.df(5.0)?
 ```
 
@@ -565,19 +616,24 @@ irm::JamshidianResult res = hw.jamshidian_swaption(
 
 ```rust
 let res = hw.jamshidian_swaption(1.0, &[2.0, 3.0, 4.0, 5.0, 6.0], 0.028, 100.0, true)?;
-assert!(res.residual.abs() < 1e-10);     // r* root quality
+assert!(res.residual.abs() < 1e-10);     // enforced by the library, reported here
 ```
 
 **Java**
 
 ```java
-JamshidianResult res = hw.jamshidianSwaption(
+HullWhite.JamshidianResult res = hw.jamshidianSwaption(
     1.0, new double[]{2.0, 3.0, 4.0, 5.0, 6.0}, 0.028, 100.0, true);
-double value = res.value;                // 2.4419483143080454
+double value = res.value();              // 2.4419483143080454
 ```
 
 Works unchanged on negative-rate curves (`hw_swaption_neg_curve` prices a
-0%-strike payer on the EUR-style curve; `r*` comes out negative).
+0%-strike payer on the EUR-style curve; `r*` comes out negative) and for
+negative fixed rates (`X = -0.5` still prices exactly). The residual
+contract `|g(r*)| < 1e-10` and a negative slope at `r*` are enforced in
+every port; `jamshidian_at_r_star(expiry, pay_times, X, r_star, ...)`
+re-runs the decomposition from a known root (e.g. receiver from the
+payer's `r*`) and raises if the root does not satisfy the contract.
 
 ---
 
@@ -620,8 +676,11 @@ splines.
 
 **C++ / Rust / Java** — same pattern: copy the instrument list with
 bumped rates, call `bootstrap` again, reprice with `df`/`par_swap_rate`
-(`parSwapRate` in Java). Bootstrapping 14 instruments costs microseconds,
-so a full keyed ladder is a loop, not a project.
+(`parSwapRate` in Java). Bootstrapping the 14-instrument USD curve costs
+about 0.8 ms in the Python reference and about 30 µs in the C++ port
+(measured, see docs/ARCHITECTURE.md §8), so a full keyed ladder is a
+loop, not a project. The localisation claim is a regression test in all
+four suites (`dv01_localises_in_quote_space`).
 
 ---
 
@@ -658,10 +717,162 @@ let (mc, se) = hw.mc_caplet(1.0, 2.0, 0.025, 100.0, 8, 50_000, 7)?;
 **Java**
 
 ```java
-double[] mc = hw.mcCaplet(1.0, 2.0, 0.025, 100.0, 8, 50000, 7);  // {price, se}
+McEstimate mc = hw.mcCaplet(1.0, 2.0, 0.025, 100.0, 8, 50000, 7L);  // price(), standardError()
 ```
 
 The pathwise discount factor is exact
 (`D(0,T) = P^M(0,T) e^{-V(T) - ∫x}`), so the only error is statistical —
 compare against the closed form with a 3-SE band, never with a fixed
-tolerance.
+tolerance. The step moments use a series for small `a·dt`, so many small
+steps (`n_steps = 2000` with `a = 1e-3`) remain unbiased.
+
+---
+
+## 14. How do I calibrate Hull-White `(a, sigma)` to caplet / swaption prices?
+
+Quotes are per unit notional; caplets as `(reset, pay, strike, price)`,
+payer swaptions as `(expiry, pay_times, fixed_rate, price)`. The fit runs
+three Nelder-Mead starts and reports the same diagnostics as the Vasicek
+fit. The recipe below generates quotes from a known model so the answer
+is checkable; in practice the prices come from `bachelier_price` applied
+to broker bp vols (recipe 15).
+
+**Python**
+
+```python
+from irm import CapletQuote, DiscountCurve, HullWhite, SwaptionQuote, calibrate_hullwhite
+
+mkt = DiscountCurve(
+    [1.0, 2.0, 3.0, 5.0, 10.0],
+    [0.9787294774691476, 0.9550419621907147, 0.9291361457915193,
+     0.8715343499971578, 0.7046880897187134])
+truth = HullWhite(a=0.08, sigma=0.012, curve=mkt)
+caplets = [CapletQuote(r, r + 1.0, 0.025, truth.caplet(r, r + 1.0, 0.025, 1.0))
+           for r in (1.0, 2.0, 4.0)]
+pays = (2.0, 3.0, 4.0, 5.0, 6.0)
+swaptions = [SwaptionQuote(1.0, pays, 0.028,
+                           truth.jamshidian_swaption(1.0, pays, 0.028, 1.0).value)]
+
+cal = calibrate_hullwhite(mkt, caplets, swaptions)
+print(cal.a, cal.sigma)                  # 0.08, 0.012 (golden hw_calib_recover, tol 1e-8)
+print(cal.converged, cal.identified, cal.at_bound, cal.rmse)   # True, True, False, ~1e-13
+hw = cal.model(mkt)
+
+cal_a = calibrate_hullwhite(mkt, caplets, swaptions, a_fixed=0.08)   # fit sigma only (1-D)
+one = calibrate_hullwhite(mkt, caplets[:1])          # one quote, two parameters:
+assert not one.identified                             # a ridge of (a, sigma) pairs
+```
+
+**C++**
+
+```cpp
+#include "irm/hullwhite.hpp"
+irm::HullWhite truth(0.08, 0.012, mkt);
+std::vector<irm::CapletQuote> caplets;
+for (double r : {1.0, 2.0, 4.0})
+    caplets.emplace_back(r, r + 1.0, 0.025, truth.caplet(r, r + 1.0, 0.025, 1.0));
+std::vector<double> pays = {2.0, 3.0, 4.0, 5.0, 6.0};
+std::vector<irm::SwaptionQuote> swaptions = {irm::SwaptionQuote(
+    1.0, pays, 0.028, truth.jamshidian_swaption(1.0, pays, 0.028, 1.0).value)};
+irm::HullWhiteCalibration cal = irm::calibrate_hullwhite(mkt, caplets, swaptions);
+// cal.a == 0.08, cal.sigma == 0.012 (1e-8), cal.converged && cal.identified
+irm::HullWhiteCalibration cal_a = irm::calibrate_hullwhite(mkt, caplets, swaptions, /*a_fixed=*/0.08);
+```
+
+**Rust**
+
+```rust
+use irm::{calibrate_hullwhite, CapletQuote, HullWhite, SwaptionQuote};
+let truth = HullWhite::new(0.08, 0.012, mkt.clone())?;
+let mut caplets = Vec::new();
+for r in [1.0, 2.0, 4.0] {
+    caplets.push(CapletQuote::new(r, r + 1.0, 0.025, truth.caplet(r, r + 1.0, 0.025, 1.0)?)?);
+}
+let pays = [2.0, 3.0, 4.0, 5.0, 6.0];
+let swaptions = [SwaptionQuote::new(
+    1.0, &pays, 0.028, truth.jamshidian_swaption(1.0, &pays, 0.028, 1.0, true)?.value)?];
+let cal = calibrate_hullwhite(&mkt, &caplets, &swaptions, None, None, 4000)?;
+assert!(cal.converged && cal.identified && (cal.a - 0.08).abs() < 1e-8);
+let cal_a = calibrate_hullwhite(&mkt, &caplets, &swaptions, Some(0.08), None, 4000)?;
+```
+
+**Java**
+
+```java
+import com.quant.irm.*;
+import java.util.ArrayList;
+import java.util.List;
+HullWhite truth = new HullWhite(0.08, 0.012, mkt);
+List<HullWhite.CapletQuote> caplets = new ArrayList<>();
+for (double r : new double[]{1.0, 2.0, 4.0})
+    caplets.add(new HullWhite.CapletQuote(r, r + 1.0, 0.025, truth.caplet(r, r + 1.0, 0.025, 1.0)));
+double[] pays = {2.0, 3.0, 4.0, 5.0, 6.0};
+List<HullWhite.SwaptionQuote> swaptions = List.of(new HullWhite.SwaptionQuote(
+    1.0, pays, 0.028, truth.jamshidianSwaption(1.0, pays, 0.028, 1.0, true).value()));
+HullWhite.Calibration cal = HullWhite.calibrate(mkt, caplets, swaptions, null, null, 4000);
+// cal.a() == 0.08, cal.sigma() == 0.012, cal.converged() && cal.identified()
+HullWhite.Calibration calA = HullWhite.calibrate(mkt, caplets, swaptions, 0.08, null, 4000);
+```
+
+---
+
+## 15. How do I convert between prices and normal (bp) implied vols?
+
+`bachelier_price(forward, strike, expiry, vol, annuity, payer)` and
+`bachelier_implied_vol(price, forward, strike, expiry, annuity, payer)`.
+The annuity is `tau * DF(pay)` for a caplet and `sum tau_i DF(u_i)` for a
+swaption; `vol` is absolute (`0.0075` = 75 bp). Negative forwards and
+strikes are fine.
+
+**Python**
+
+```python
+from irm import DiscountCurve, HullWhite, bachelier_implied_vol, bachelier_price, par_swap_rate
+
+mkt = DiscountCurve(
+    [1.0, 2.0, 3.0, 5.0, 10.0],
+    [0.9787294774691476, 0.9550419621907147, 0.9291361457915193,
+     0.8715343499971578, 0.7046880897187134])
+hw = HullWhite(a=0.1, sigma=0.01, curve=mkt)
+
+# Model caplet -> bp vol
+reset, pay, k = 1.0, 2.0, 0.025
+fwd, ann = mkt.fwd_rate(reset, pay), (pay - reset) * mkt.df(pay)
+price = hw.caplet(reset, pay, k, 1.0)                     # 0.003444276269860027 per unit notional
+vol = bachelier_implied_vol(price, fwd, k, reset, ann)    # ~0.0095 -> 95 bp
+assert abs(bachelier_price(fwd, k, reset, vol, ann) - price) < 1e-15
+
+# Broker quote -> price (what calibrate_hullwhite wants)
+pays = [2.0, 3.0, 4.0, 5.0, 6.0]
+f_swap = par_swap_rate(mkt, [1.0] + pays)
+a_swap = sum((b - a) * mkt.df(b) for a, b in zip([1.0] + pays[:-1], pays))
+quote_price = bachelier_price(f_swap, f_swap, 1.0, 0.0080, a_swap)   # 80 bp ATM payer
+print(bachelier_price(0.03, 0.025, 2.0, 0.0075, 4.2))     # 0.030210864350656882 (golden)
+```
+
+**C++**
+
+```cpp
+#include "irm/bachelier.hpp"
+double p = irm::bachelier_price(0.03, 0.025, 2.0, 0.0075, 4.2, /*payer=*/true);   // 0.030210864350656882
+double v = irm::bachelier_implied_vol(p, 0.03, 0.025, 2.0, 4.2, true);            // 0.0075
+```
+
+**Rust**
+
+```rust
+use irm::{bachelier_implied_vol, bachelier_price};
+let p = bachelier_price(0.03, 0.025, 2.0, 0.0075, 4.2, true)?;   // 0.030210864350656882
+let v = bachelier_implied_vol(p, 0.03, 0.025, 2.0, 4.2, true)?;  // 0.0075
+```
+
+**Java**
+
+```java
+double p = Bachelier.price(0.03, 0.025, 2.0, 0.0075, 4.2, true);      // 0.030210864350656882
+double v = Bachelier.impliedVol(p, 0.03, 0.025, 2.0, 4.2, true);      // 0.0075
+```
+
+A price below intrinsic raises; a price at intrinsic (to 1e-15) returns
+vol 0; deep in-the-money quotes whose time value is below double
+precision round-trip in *price*, not in vol — which is the honest answer.

@@ -12,36 +12,61 @@ classDiagram
   class Swap { +maturity +rate +pillar +residual(curve) }
   class OISSwap { +maturity +rate +pillar +residual(curve) }
   class bootstrap { <<function>> instruments -> DiscountCurve }
+  class solve_pillar_df { <<function>> residual, pillar -> DF }
   class Vasicek {
-    +kappa +theta +sigma +r0
+    +kappa +theta +sigma +r0 (read-only)
     +b_factor(tau) +a_factor(tau)
     +zcb_price(T) +zero_yield(T)
-    +r_mean(T) +r_var(T)
+    +r_mean(T, r) +r_var(T)
     +zbc(T,S,K) +zbp(T,S,K)
     +simulate() +mc_zcb()
   }
-  class VasicekCalibration { +kappa +theta +sigma +rmse +converged +model() }
+  class VasicekCalibration {
+    +kappa +theta +sigma +rmse
+    +converged +at_bound +identified
+    +n_starts +kappa_spread +theta_spread +sigma_spread
+    +sigma_fixed +model()
+  }
   class HullWhite {
-    +a +sigma +curve
-    +fwd0(t) +theta(t)
+    +a +sigma +curve (read-only)
+    +fwd0(t) +theta(t, h)
     +b_factor(t,T) +a_factor(t,T) +zcb_price(t,T,r)
     +zbc() +zbp() +caplet() +floorlet() +cap()
-    +jamshidian_swaption() +mc_caplet()
+    +jamshidian_swaption() +jamshidian_at_r_star()
+    +mc_caplet()
   }
   class JamshidianResult { +value +r_star +residual +strikes }
+  class CapletQuote { +reset +pay +strike +price }
+  class SwaptionQuote { +expiry +pay_times +fixed_rate +price }
+  class HullWhiteCalibration {
+    +a +sigma +rmse
+    +converged +at_bound +identified
+    +n_starts +a_spread +sigma_spread +a_fixed
+    +model(curve)
+  }
+  class bachelier { <<functions>> price / implied_vol }
   class brentq { <<function>> }
   class nelder_mead { <<function>> }
+  class ou_step_moments { <<function>> expm1 + series }
 
   Deposit ..|> Instrument
   FRA ..|> Instrument
   Swap ..|> Instrument
   OISSwap ..|> Instrument
   bootstrap --> Instrument : solves each
-  bootstrap --> brentq : DF root find
+  bootstrap --> solve_pillar_df : per pillar
+  solve_pillar_df --> brentq : DF root find
   bootstrap --> DiscountCurve : produces
   Instrument --> DiscountCurve : residual(trial curve)
   HullWhite --> DiscountCurve : fitted to
   HullWhite --> brentq : r* root find
   HullWhite --> JamshidianResult : returns
-  Vasicek --> nelder_mead : calibration
+  HullWhite --> ou_step_moments : MC
+  Vasicek --> ou_step_moments : MC
+  Vasicek --> nelder_mead : calibrate_vasicek
   Vasicek --> VasicekCalibration : returns
+  CapletQuote --> HullWhiteCalibration : calibrate_hullwhite
+  SwaptionQuote --> HullWhiteCalibration : calibrate_hullwhite
+  HullWhiteCalibration --> nelder_mead : uses
+  HullWhiteCalibration --> HullWhite : builds
+  bachelier --> brentq : implied vol

@@ -2,7 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use irm::{bootstrap, load_curve_quotes, DiscountCurve, HullWhite};
+use irm::{
+    bootstrap, calibrate_hullwhite, load_curve_quotes, ou_integral_variance, CapletQuote,
+    DiscountCurve, HullWhite, IrmError, SwaptionQuote, JAMSHIDIAN_RESIDUAL_TOL,
+};
 
 const A: f64 = 0.1;
 const SIGMA: f64 = 0.01;
@@ -221,4 +224,269 @@ fn invalid_inputs_rejected() {
     assert!(hw.jamshidian_swaption(1.0, &[0.5], 0.02, 1.0, true).is_err());
     assert!(hw.fwd0(-1.0).is_err());
     assert!(hw.mc_caplet(0.0, 1.0, 0.02, 1.0, 4, 10, 1).is_err());
+}
+
+// ---- validation of notional / strike / schedule (MAJOR-5) --------------------
+
+#[test]
+fn non_finite_notional_and_mc_strike_rejected() {
+    let hw = hw();
+    assert!(hw.caplet(1.0, 2.0, 0.025, f64::NAN).is_err());
+    assert!(hw.floorlet(1.0, 2.0, 0.025, f64::INFINITY).is_err());
+    assert!(hw.cap(&[1.0, 2.0, 3.0], 0.02, f64::INFINITY).is_err());
+    assert!(hw.jamshidian_swaption(1.0, &[2.0, 3.0], 0.02, f64::NAN, true).is_err());
+    assert!(hw.mc_caplet(1.0, 2.0, f64::NAN, 100.0, 8, 100, 1).is_err());
+    assert!(hw.mc_caplet(1.0, 2.0, -1.5, 100.0, 8, 100, 1).is_err());
+    assert!(hw.mc_caplet(1.0, 2.0, 0.02, f64::INFINITY, 8, 100, 1).is_err());
+    assert!(hw.caplet(f64::NAN, 2.0, 0.02, 1.0).is_err());
+    assert!(hw.b_factor(f64::NAN, 5.0).is_err());
+    assert!(hw.b_factor(-1.0, 5.0).is_err());
+    assert!(hw.jamshidian_swaption(1.0, &[2.0, f64::INFINITY], 0.02, 1.0, true).is_err());
+    assert!(hw.theta_with_step(1.0, 0.0).is_err());
+    assert!(hw.zcb_price(1.0, 5.0, Some(-1e6)).is_err()); // exp overflow
+    // A negative notional is a short position, not an error.
+    let long = hw.caplet(1.0, 2.0, 0.025, 100.0).unwrap();
+    assert!((hw.caplet(1.0, 2.0, 0.025, -100.0).unwrap() + long).abs() < 1e-15);
+}
+
+#[test]
+fn cap_schedule_non_increasing_rejected() {
+    let hw = hw();
+    assert!(hw.cap(&[1.0, 2.0, 2.0, 3.0], 0.02, 1.0).is_err());
+    assert!(hw.cap(&[1.0, f64::NAN, 3.0], 0.02, 1.0).is_err());
+    assert!(hw.cap(&[-1.0, 1.0], 0.02, 1.0).is_err());
+    assert!(hw.cap(&[1.0, 2.0], f64::NAN, 1.0).is_err());
+}
+
+#[test]
+fn theta_with_step_matches_default() {
+    let hw = hw();
+    assert_eq!(hw.theta(0.5).unwrap(), hw.theta_with_step(0.5, 1e-4).unwrap());
+}
+
+// ---- Jamshidian contract (MAJOR-6, MINOR-4) ----------------------------------
+
+#[test]
+fn jamshidian_residual_contract_enforced() {
+    let hw = hw();
+    let pays = [2.0, 3.0, 4.0, 5.0, 6.0];
+    let res = hw.jamshidian_swaption(1.0, &pays, 0.028, 100.0, true).unwrap();
+    let again = hw.jamshidian_at_r_star(1.0, &pays, 0.028, res.r_star, 100.0, true).unwrap();
+    assert!((again.value - res.value).abs() < 1e-14);
+    assert_eq!(again.residual, res.residual);
+    assert!(again.residual.abs() < JAMSHIDIAN_RESIDUAL_TOL);
+    // A wrong r* violates |g(r*)| < 1e-10 -> RootFind error.
+    assert!(matches!(
+        hw.jamshidian_at_r_star(1.0, &pays, 0.028, -1.0, 100.0, true),
+        Err(IrmError::RootFind(_))
+    ));
+    assert!(matches!(
+        hw.jamshidian_at_r_star(1.0, &pays, 0.028, res.r_star + 1e-6, 100.0, true),
+        Err(IrmError::RootFind(_))
+    ));
+    assert!(matches!(
+        hw.jamshidian_at_r_star(1.0, &pays, 0.028, f64::NAN, 100.0, true),
+        Err(IrmError::InvalidInput(_))
+    ));
+    let rec = hw.jamshidian_at_r_star(1.0, &pays, 0.028, res.r_star, 100.0, false).unwrap();
+    let rec2 = hw.jamshidian_swaption(1.0, &pays, 0.028, 100.0, false).unwrap();
+    assert!((rec.value - rec2.value).abs() < 1e-14);
+}
+
+/// Payer swaption per unit notional by direct integration of the payoff
+/// (1 - g(r_T))^+ under the T-forward Gaussian law of r_T (Simpson from the
+/// payoff kink to mu + 12 sd) — independent of the decomposition.
+fn swaption_by_integration(hw: &HullWhite, expiry: f64, pays: &[f64], x: f64) -> f64 {
+    let n = 2000;
+    let c = hw.curve();
+    let v = hw.sigma() * hw.sigma() * (-(-2.0 * hw.a() * expiry).exp_m1()) / (2.0 * hw.a());
+    let b1 = hw.b_factor(expiry, pays[0]).unwrap();
+    let a1 = hw.a_factor(expiry, pays[0]).unwrap();
+    let mu = ((a1 * c.df(expiry).unwrap() / c.df(pays[0]).unwrap()).ln() + b1 * b1 * v / 2.0) / b1;
+    let mut coupons = Vec::new();
+    let mut prev = expiry;
+    for &t in pays {
+        coupons.push(x * (t - prev));
+        prev = t;
+    }
+    let last = coupons.len() - 1;
+    coupons[last] += 1.0;
+    let sd = v.sqrt();
+    let payoff = |r: f64| -> f64 {
+        let g: f64 = coupons
+            .iter()
+            .zip(pays.iter())
+            .map(|(ci, &t)| ci * hw.zcb_price(expiry, t, Some(r)).unwrap())
+            .sum();
+        (1.0 - g).max(0.0)
+    };
+    let (mut lo, mut hi) = (mu - 12.0 * sd, mu + 12.0 * sd);
+    while lo < mu - 400.0 * sd || payoff(lo) > 0.0 {
+        lo -= 12.0 * sd;
+    }
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if payoff(mid) > 0.0 {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let (kink, top) = (hi, mu + 12.0 * sd);
+    let h = (top - kink) / n as f64;
+    let mut total = 0.0;
+    for i in 0..=n {
+        let r = kink + i as f64 * h;
+        let w = (-0.5 * ((r - mu) / sd).powi(2)).exp() / (sd * (2.0 * std::f64::consts::PI).sqrt());
+        let coef = if i == 0 || i == n { 1.0 } else if i % 2 == 1 { 4.0 } else { 2.0 };
+        total += coef * payoff(r) * w;
+    }
+    c.df(expiry).unwrap() * total * h / 3.0
+}
+
+#[test]
+fn jamshidian_negative_fixed_rate_stays_exact() {
+    // For X < 0 the coupon signs are (-, ..., -, +): g is not monotone but
+    // g - 1 still has a single crossing, so the decomposition is exact;
+    // 1 + X tau_n <= 0 is the genuinely degenerate case.
+    let hw = hw();
+    let pays = [2.0, 3.0, 4.0, 5.0, 6.0];
+    for x in [-0.005, -0.2, -0.5] {
+        let res = hw.jamshidian_swaption(1.0, &pays, x, 1.0, true).unwrap();
+        assert!(res.value > 0.0);
+        assert!(res.residual.abs() < 1e-10);
+        let by_int = swaption_by_integration(&hw, 1.0, &pays, x);
+        assert!((res.value / by_int - 1.0).abs() < 1e-9, "X={x}: {} vs {by_int}", res.value);
+    }
+    assert!(hw.jamshidian_swaption(1.0, &pays, -0.005, 1.0, true).unwrap().r_star < 0.0);
+    assert!(matches!(
+        hw.jamshidian_swaption(1.0, &pays, -1.0, 1.0, true),
+        Err(IrmError::InvalidInput(_))
+    ));
+    assert!(hw.jamshidian_swaption(1.0, &pays, -1.5, 1.0, true).is_err());
+    let ok = hw.jamshidian_swaption(1.0, &pays, -0.8, 1.0, true).unwrap();
+    assert!(ok.residual.abs() < 1e-10);
+    // Beyond about -0.95 the coupon-bond terms are O(1e8+) and |g(r*)| cannot
+    // beat 1e-10 in double precision: the contract rejects it honestly.
+    assert!(matches!(
+        hw.jamshidian_swaption(1.0, &pays, -0.99, 1.0, true),
+        Err(IrmError::RootFind(_))
+    ));
+    let pos = hw.jamshidian_swaption(1.0, &pays, 0.028, 1.0, true).unwrap();
+    assert!((pos.value / swaption_by_integration(&hw, 1.0, &pays, 0.028) - 1.0).abs() < 1e-9);
+}
+
+// ---- Monte Carlo determinism / small mean reversion ---------------------------
+
+#[test]
+fn mc_caplet_same_seed_and_single_path() {
+    let hw = hw();
+    let a = hw.mc_caplet(1.0, 2.0, 0.025, 100.0, 4, 500, 3).unwrap();
+    let b = hw.mc_caplet(1.0, 2.0, 0.025, 100.0, 4, 500, 3).unwrap();
+    let c = hw.mc_caplet(1.0, 2.0, 0.025, 100.0, 4, 500, 4).unwrap();
+    assert_eq!(a, b);
+    assert_ne!(a, c);
+    let (price, se) = hw.mc_caplet(1.0, 2.0, 0.02, 100.0, 1, 1, 1).unwrap();
+    assert!(price.is_finite() && price >= 0.0);
+    assert_eq!(se, 0.0);
+}
+
+#[test]
+fn mc_caplet_tiny_mean_reversion_unbiased() {
+    // a*dt = 5e-7 per step exercises the series branch of var_i and V(t).
+    let slow = HullWhite::new(1e-4, 0.01, curve()).unwrap();
+    let analytic = slow.caplet(1.0, 2.0, 0.025, 100.0).unwrap();
+    let (price, se) = slow.mc_caplet(1.0, 2.0, 0.025, 100.0, 200, 20_000, 9).unwrap();
+    assert!((price - analytic).abs() < 3.0 * se, "MC {price} vs {analytic}, se {se}");
+}
+
+#[test]
+fn variance_integral_uses_cancellation_free_kernel() {
+    let slow = HullWhite::new(1e-5, 0.02, curve()).unwrap();
+    let v = slow.variance_integral(1.0).unwrap();
+    assert!((v - 0.5 * ou_integral_variance(1e-5, 0.02, 1.0).unwrap()).abs() < 1e-20);
+    assert!((v / (0.02_f64 * 0.02 / 6.0) - 1.0).abs() < 1e-5);
+    assert_eq!(slow.variance_integral(0.0).unwrap(), 0.0);
+}
+
+// ---- calibration of (a, sigma) (MAJOR-7) --------------------------------------
+
+fn quotes(truth: &HullWhite) -> (Vec<CapletQuote>, Vec<SwaptionQuote>) {
+    let caps: Vec<CapletQuote> = [1.0, 2.0, 4.0]
+        .iter()
+        .map(|&r| CapletQuote::new(r, r + 1.0, 0.025, truth.caplet(r, r + 1.0, 0.025, 1.0).unwrap()).unwrap())
+        .collect();
+    let pays = [2.0, 3.0, 4.0, 5.0, 6.0];
+    let swp = SwaptionQuote::new(
+        1.0,
+        &pays,
+        0.028,
+        truth.jamshidian_swaption(1.0, &pays, 0.028, 1.0, true).unwrap().value,
+    )
+    .unwrap();
+    (caps, vec![swp])
+}
+
+#[test]
+fn calibrate_hullwhite_recovers_a_and_sigma() {
+    let truth = HullWhite::new(0.08, 0.012, curve()).unwrap();
+    let (caps, swps) = quotes(&truth);
+    let cal = calibrate_hullwhite(&curve(), &caps, &swps, None, None, 4000).unwrap();
+    assert!(cal.converged && cal.identified && !cal.at_bound && !cal.a_fixed);
+    assert_eq!(cal.n_starts, 3);
+    assert!((cal.a - 0.08).abs() < 1e-8, "a = {}", cal.a);
+    assert!((cal.sigma - 0.012).abs() < 1e-9, "sigma = {}", cal.sigma);
+    assert!(cal.rmse < 1e-10);
+    let model = cal.model(curve()).unwrap();
+    for q in &caps {
+        assert!((model.caplet(q.reset, q.pay, q.strike, 1.0).unwrap() - q.price).abs() < 1e-10);
+    }
+}
+
+#[test]
+fn calibrate_hullwhite_a_fixed_and_warm_start() {
+    let truth = HullWhite::new(0.08, 0.012, curve()).unwrap();
+    let (caps, swps) = quotes(&truth);
+    let cal = calibrate_hullwhite(&curve(), &caps, &swps, Some(0.08), None, 4000).unwrap();
+    assert!(cal.a_fixed && cal.a == 0.08);
+    assert!(cal.converged && cal.identified);
+    assert!((cal.sigma - 0.012).abs() < 1e-9);
+    let warm = calibrate_hullwhite(&curve(), &caps, &swps, None, Some([0.2, 0.02]), 4000).unwrap();
+    assert_eq!(warm.n_starts, 1);
+    assert!(!warm.identified && warm.converged);
+    assert!((warm.a - 0.08).abs() < 1e-6);
+    assert!((warm.sigma - 0.012).abs() < 1e-8);
+    let only_caps = calibrate_hullwhite(&curve(), &caps, &[], None, None, 4000).unwrap();
+    assert!((only_caps.sigma - 0.012).abs() < 1e-8);
+    let only_swp = calibrate_hullwhite(&curve(), &[], &swps, Some(0.08), None, 4000).unwrap();
+    assert!((only_swp.sigma - 0.012).abs() < 1e-8);
+}
+
+#[test]
+fn calibrate_hullwhite_single_quote_not_identified() {
+    let truth = HullWhite::new(0.08, 0.012, curve()).unwrap();
+    let (caps, _) = quotes(&truth);
+    let cal = calibrate_hullwhite(&curve(), &caps[..1], &[], None, None, 4000).unwrap();
+    assert!(cal.converged);
+    assert!(!cal.identified); // one price, two parameters: a ridge
+    assert!(cal.a_spread > 1e-2);
+    assert!(cal.rmse < 1e-9);
+}
+
+#[test]
+fn calibrate_hullwhite_non_convergence_and_validation() {
+    let truth = HullWhite::new(0.08, 0.012, curve()).unwrap();
+    let (caps, swps) = quotes(&truth);
+    let res = calibrate_hullwhite(&curve(), &caps, &swps, None, None, 2).unwrap();
+    assert!(!res.converged && res.rmse.is_finite());
+    assert!(calibrate_hullwhite(&curve(), &[], &[], None, None, 4000).is_err());
+    assert!(calibrate_hullwhite(&curve(), &caps, &swps, Some(0.0), None, 4000).is_err());
+    assert!(calibrate_hullwhite(&curve(), &caps, &swps, None, Some([f64::NAN, 0.01]), 4000).is_err());
+    assert!(calibrate_hullwhite(&curve(), &caps, &swps, None, None, 0).is_err());
+    assert!(CapletQuote::new(1.0, 2.0, 0.02, f64::NAN).is_err());
+    assert!(CapletQuote::new(2.0, 1.0, 0.02, 0.001).is_err());
+    assert!(CapletQuote::new(1.0, 2.0, 0.02, -0.001).is_err());
+    assert!(SwaptionQuote::new(1.0, &[0.5, 2.0], 0.02, 0.001).is_err());
+    assert!(SwaptionQuote::new(1.0, &[], 0.02, 0.001).is_err());
+    assert!(SwaptionQuote::new(f64::INFINITY, &[2.0], 0.02, 0.001).is_err());
 }

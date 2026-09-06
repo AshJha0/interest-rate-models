@@ -2,7 +2,7 @@
 #define IRM_OPTIMIZE_HPP
 
 /// \file optimize.hpp
-/// \brief Native Nelder-Mead simplex minimiser (P02-style API).
+/// \brief Native Nelder-Mead simplex minimiser.
 ///
 /// Used by the Vasicek least-squares calibration.  Standard coefficients:
 /// reflection 1, expansion 2, contraction 0.5, shrink 0.5.  Non-convergence

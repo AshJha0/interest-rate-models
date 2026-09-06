@@ -49,11 +49,20 @@ int main() {
 
         // ---- 2. Vasicek calibration ------------------------------------ //
         const auto [ts, ys] = irm::load_zero_yields(kDataDir + "/zero_yields.csv");
-        const irm::VasicekCalibration cal = irm::calibrate_vasicek(ts, ys, /*r0=*/0.03);
-        std::printf("\nVasicek calibration to data/zero_yields.csv (r0 = 3%%):\n");
-        std::printf("  kappa=%.4f  theta=%.4f  sigma=%.4f  rmse=%.2e  iters=%d  converged=%s\n",
-                    cal.kappa, cal.theta, cal.sigma, cal.rmse, cal.iterations,
-                    cal.converged ? "true" : "false");
+        irm::VasicekCalibration cal = irm::calibrate_vasicek(ts, ys, /*r0=*/0.03);
+        std::printf("\nVasicek calibration to data/zero_yields.csv (r0 = 3%%), 3 starts:\n");
+        std::printf("  kappa=%.4f  theta=%.4f  sigma=%.4f  rmse=%.2e  converged=%s  at_bound=%s\n",
+                    cal.kappa, cal.theta, cal.sigma, cal.rmse, cal.converged ? "true" : "false",
+                    cal.at_bound ? "true" : "false");
+        std::printf("  identified=%s  spreads across equivalent starts: kappa %.3f, theta %.4f, "
+                    "sigma %.4f\n",
+                    cal.identified ? "true" : "false", cal.kappa_spread, cal.theta_spread,
+                    cal.sigma_spread);
+        cal = irm::calibrate_vasicek(ts, ys, 0.03, std::nullopt, 4000, /*sigma_fixed=*/0.02);
+        std::printf("  with sigma fixed at 0.02 (from option prices):\n");
+        std::printf("  kappa=%.4f  theta=%.4f  rmse=%.2e  converged=%s  identified=%s\n", cal.kappa,
+                    cal.theta, cal.rmse, cal.converged ? "true" : "false",
+                    cal.identified ? "true" : "false");
         const irm::Vasicek model = cal.model();
         std::printf("  %4s %11s %9s\n", "T", "mkt yield %", "model %");
         for (std::size_t i = 0; i < ts.size(); i += 3) {
@@ -99,6 +108,37 @@ int main() {
             eur_hw.jamshidian_swaption(1.0, {2.0, 3.0, 4.0}, eur_par, /*notional=*/100.0);
         std::printf("  EUR (negative rates) 1y-into-3y @ %.4f%%: value = %.6f, r* = %.6f\n",
                     100.0 * eur_par, eur_res.value, eur_res.r_star);
+
+        // ---- 5. Hull-White calibration + Bachelier vols ---------------- //
+        std::printf("\nHull-White calibration to USD caplet/swaption prices (a, sigma free):\n");
+        const irm::HullWhite truth(0.08, 0.012, usd);
+        std::vector<irm::CapletQuote> caplets;
+        for (double r : {1.0, 2.0, 4.0}) {
+            caplets.emplace_back(r, r + 1.0, atm, truth.caplet(r, r + 1.0, atm, 1.0));
+        }
+        const std::vector<irm::SwaptionQuote> swaptions = {irm::SwaptionQuote(
+            expiry, pay_times, fwd_par,
+            truth.jamshidian_swaption(expiry, pay_times, fwd_par, 1.0).value)};
+        const irm::HullWhiteCalibration hcal = irm::calibrate_hullwhite(usd, caplets, swaptions);
+        std::printf("  a=%.6f  sigma=%.6f  rmse=%.1e  converged=%s  identified=%s  (true: 0.08, "
+                    "0.012)\n",
+                    hcal.a, hcal.sigma, hcal.rmse, hcal.converged ? "true" : "false",
+                    hcal.identified ? "true" : "false");
+        std::printf("  normal (bp) implied vols of the calibrated model:\n");
+        for (const auto& q : caplets) {
+            const double fwd = usd.fwd_rate(q.reset, q.pay);
+            const double ann = (q.pay - q.reset) * usd.df(q.pay);
+            const double vol = irm::bachelier_implied_vol(q.price, fwd, q.strike, q.reset, ann);
+            std::printf("    caplet %.0fy->%.0fy  %6.1f bp\n", q.reset, q.pay, 1e4 * vol);
+        }
+        double ann = 0.0, prev = expiry;
+        for (double t : pay_times) {
+            ann += (t - prev) * usd.df(t);
+            prev = t;
+        }
+        const double svol =
+            irm::bachelier_implied_vol(swaptions[0].price, fwd_par, fwd_par, expiry, ann);
+        std::printf("    1y-into-5y swaption   %6.1f bp\n", 1e4 * svol);
 
         std::printf("\ndone.\n");
         return 0;

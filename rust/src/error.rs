@@ -13,11 +13,13 @@ pub enum IrmError {
     /// An argument violated its domain (non-finite value, bad ordering,
     /// non-positive discount factor, ...).
     InvalidInput(String),
-    /// A root finder failed: the root was not bracketed or the iteration
-    /// budget was exhausted.
+    /// A root finder failed: the root was not bracketed, a function value
+    /// was not finite, the iteration budget was exhausted, or a root
+    /// contract (Jamshidian residual / slope) was violated.
     RootFind(String),
-    /// The bootstrap could not find an admissible positive discount factor
-    /// for a pillar (crossed / arbitrageable quotes).
+    /// The bootstrap failed at a pillar: either no admissible positive
+    /// discount factor exists (crossed / arbitrageable quotes — the message
+    /// says so) or the solver failed for another reason ("solver failed").
     Bootstrap(String),
     /// A bundled data file could not be read or parsed.
     Data(String),

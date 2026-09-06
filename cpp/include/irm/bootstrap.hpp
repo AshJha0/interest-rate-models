@@ -27,10 +27,15 @@
 ///    with `annuity = sum_i tau_i DF(t_i)` over the annual fixed schedule.
 ///
 /// The root is found with the native Brent solver on the bracket
-/// `DF in [1e-10, 100]` with `xtol = 1e-14`.  A bracket failure means no
-/// positive discount factor can reprice the quote — i.e. crossed /
-/// arbitrageable quotes (the "negative implied DF" case) — and throws.
+/// `DF in [1e-10, 100]` with `xtol = 1e-14`.  A *bracketing* failure means
+/// no positive discount factor can reprice the quote — i.e. crossed /
+/// arbitrageable quotes (the "negative implied DF" case) — and throws a
+/// std::domain_error saying so; any other solver failure (non-finite
+/// residual, iteration budget) is reported as a solver failure at that
+/// pillar, never relabelled as crossed quotes.  Maturities are bounded to
+/// `[kMinMaturity, kMaxMaturity] = [1e-6, 200]` years at construction.
 
+#include <functional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -39,13 +44,33 @@
 
 namespace irm {
 
+/// Smallest instrument maturity / FRA end accepted (years).  Guarantees the
+/// annual schedule has at least one payment.
+constexpr double kMinMaturity = 1e-6;
+/// Largest instrument maturity accepted (years).  Bounds the schedule length
+/// (at most 200 payments) so a maturity typed in days cannot allocate
+/// gigabytes or overflow the float -> int conversion (UB).
+constexpr double kMaxMaturity = 200.0;
+
 /// Annual fixed-leg payment times ending exactly at \p maturity.
 ///
 /// `n = ceil(maturity - 1e-12)` payments at `maturity - (n-1), ..., maturity`;
 /// e.g. 2.0 -> {1.0, 2.0}; 2.5 -> {0.5, 1.5, 2.5}; 0.25 -> {0.25}.  A short
 /// first stub (< 1y) is created for non-integer maturities.
 /// \throws std::invalid_argument for non-finite or non-positive maturity.
+/// \throws std::invalid_argument unless kMinMaturity <= maturity <= kMaxMaturity
+///   (finite), so `1 <= n <= 200` always.
 std::vector<double> annual_schedule(double maturity);
+
+/// Solve `residual(DF) = 0` for one pillar on the bracket `[1e-10, 100]`
+/// (`xtol = 1e-14`).  This is the per-pillar kernel of bootstrap(), exposed
+/// so the error classification can be tested directly:
+///  * no sign change on the bracket -> std::domain_error "no admissible
+///    positive discount factor — crossed/arbitrageable quotes";
+///  * any other solver failure (non-finite residual, iteration budget) ->
+///    std::domain_error "solver failed at pillar" carrying the solver message.
+double solve_pillar_df(const std::function<double(double)>& residual, double pillar,
+                       const std::string& label);
 
 /// Cash deposit paying simple interest `rate` at `maturity`.
 struct Deposit {
@@ -127,7 +152,9 @@ std::string instrument_name(const Instrument& ins);
 /// `[1e-10, 100]` (DF > 1 allowed: negative rates).
 /// \throws std::invalid_argument on an empty list or ordering violations.
 /// \throws std::domain_error when no positive DF can reprice a quote
-///   (crossed/arbitrageable inputs), naming the offending pillar.
+///   (crossed/arbitrageable inputs, message says so) or when the solver
+///   fails for any other reason (message says "solver failed"), naming the
+///   offending pillar in both cases (see solve_pillar_df()).
 DiscountCurve bootstrap(const std::vector<Instrument>& instruments);
 
 }  // namespace irm

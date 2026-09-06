@@ -132,4 +132,11 @@ public class CurveTest {
         assertThrows(IllegalArgumentException.class,
                 () -> DiscountCurve.parSwapRate(c, new double[] {0.0, 2.0, 1.0}));
     }
+
+    @Test
+    public void fwdRateUnderflowIsStandardError() {
+        DiscountCurve c = new DiscountCurve(new double[] {1.0}, new double[] {0.95});
+        assertThrows(IllegalArgumentException.class, () -> c.fwdRate(0.0, 1e6)); // DF underflows
+        assertTrue(Double.isFinite(c.fwdRate(0.0, 500.0)));
+    }
 }

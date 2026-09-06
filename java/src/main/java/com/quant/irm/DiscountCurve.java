@@ -180,7 +180,9 @@ public final class DiscountCurve {
      * Simply compounded forward rate over {@code [t1, t2]}:
      * {@code F(t1, t2) = (DF(t1)/DF(t2) - 1) / (t2 - t1)}.
      *
-     * @throws IllegalArgumentException unless {@code 0 <= t1 < t2} and both finite
+     * @throws IllegalArgumentException unless {@code 0 <= t1 < t2} and both
+     *     finite, or if the result is not representable (DF(t2) underflowed
+     *     to 0 or the ratio overflowed) — never returns infinity
      */
     public double fwdRate(double t1, double t2) {
         if (!(Double.isFinite(t1) && Double.isFinite(t2))) {
@@ -190,7 +192,18 @@ public final class DiscountCurve {
             throw new IllegalArgumentException(
                     "need 0 <= t1 < t2 for a forward rate, got t1=" + t1 + ", t2=" + t2);
         }
-        return (df(t1) / df(t2) - 1.0) / (t2 - t1);
+        double df1 = df(t1);
+        double df2 = df(t2);
+        if (df2 == 0.0) {
+            throw new IllegalArgumentException("forward rate over [" + t1 + ", " + t2
+                    + "] not representable: DF(t2) underflowed to 0");
+        }
+        double fwd = (df1 / df2 - 1.0) / (t2 - t1);
+        if (!Double.isFinite(fwd)) {
+            throw new IllegalArgumentException(
+                    "forward rate over [" + t1 + ", " + t2 + "] not representable: " + fwd);
+        }
+        return fwd;
     }
 
     /**

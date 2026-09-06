@@ -1,14 +1,31 @@
 #include "irm/quotes.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <vector>
 
 namespace irm {
 
 namespace {
+
+/// Locale-independent decimal parse (std::stod honours the global C locale,
+/// under which "0.25" parses as 0 in e.g. de_DE).  Leading/trailing blanks
+/// are tolerated; anything else in the field is an error.
+double parse_double(const std::string& field, const std::string& path) {
+    std::size_t b = 0, e = field.size();
+    while (b < e && (field[b] == ' ' || field[b] == '\t')) ++b;
+    while (e > b && (field[e - 1] == ' ' || field[e - 1] == '\t')) --e;
+    double value = 0.0;
+    const auto res = std::from_chars(field.data() + b, field.data() + e, value);
+    if (res.ec != std::errc() || res.ptr != field.data() + e || b == e) {
+        throw std::invalid_argument("bad numeric field '" + field + "' in " + path);
+    }
+    return value;
+}
 
 /// Split one CSV line on commas (the bundled files contain no quoting).
 std::vector<std::string> split_csv(const std::string& line) {
@@ -60,9 +77,9 @@ std::vector<Instrument> load_curve_quotes(const std::string& path,
         }
         if (row[0] != curve_id) continue;
         const std::string& kind = row[1];
-        const double start = std::stod(row[2]);
-        const double maturity = std::stod(row[3]);
-        const double rate = std::stod(row[4]);
+        const double start = parse_double(row[2], path);
+        const double maturity = parse_double(row[3], path);
+        const double rate = parse_double(row[4], path);
         if (kind == "deposit") {
             out.emplace_back(Deposit(maturity, rate));
         } else if (kind == "fra") {
@@ -86,7 +103,7 @@ std::vector<Instrument> load_ois_quotes(const std::string& path) {
         if (row.size() != 2) {
             throw std::invalid_argument("malformed row in " + path);
         }
-        out.emplace_back(OISSwap(std::stod(row[0]), std::stod(row[1])));
+        out.emplace_back(OISSwap(parse_double(row[0], path), parse_double(row[1], path)));
     }
     if (out.empty()) {
         throw std::invalid_argument("no OIS quotes in " + path);
@@ -102,8 +119,8 @@ std::pair<std::vector<double>, std::vector<double>> load_zero_yields(const std::
         if (row.size() != 2) {
             throw std::invalid_argument("malformed row in " + path);
         }
-        ts.push_back(std::stod(row[0]));
-        ys.push_back(std::stod(row[1]));
+        ts.push_back(parse_double(row[0], path));
+        ys.push_back(parse_double(row[1], path));
     }
     if (ts.empty()) {
         throw std::invalid_argument("no zero yields in " + path);

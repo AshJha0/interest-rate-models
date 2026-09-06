@@ -2,7 +2,7 @@
 name = "irm"
 version = "0.1.0"
 edition = "2021"
-description = "Interest rate models: curve bootstrapping, Vasicek, Hull-White 1F (P04 port)"
+description = "Interest rate models: curve bootstrapping, Vasicek, Hull-White 1F (Rust port)"
 
 [dependencies]
 rand = "0.9"

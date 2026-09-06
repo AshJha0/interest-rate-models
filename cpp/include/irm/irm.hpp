@@ -5,6 +5,7 @@
 /// \brief Umbrella header for the irm library: discount-curve bootstrapping,
 /// the Vasicek short-rate model, and the Hull-White one-factor model.
 
+#include "irm/bachelier.hpp"
 #include "irm/bootstrap.hpp"
 #include "irm/curve.hpp"
 #include "irm/hullwhite.hpp"

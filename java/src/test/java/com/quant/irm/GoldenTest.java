@@ -15,16 +15,46 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
 
 /**
  * Golden-value suite: every case in ../data/golden/golden.json is recomputed
  * through the public API and must agree within its stored tolerance. The
  * dispatcher mirrors the Python reference test one-to-one (see API_SPEC.md
- * sections 8-9); bootstrap cases load quotes from ../data/*.csv.
+ * sections 8-9); bootstrap cases load quotes from ../data/*.csv. Each case
+ * is its own parameterised test, so a single bad case cannot mask the others.
  */
+@RunWith(Parameterized.class)
 public class GoldenTest {
 
     private static final Path DATA_DIR = Paths.get("..", "data");
+    private static final int EXPECTED_CASES = 33;
+
+    /** Parameterised over every golden case name. */
+    @Parameters(name = "{0}")
+    public static List<Object[]> cases() throws IOException {
+        List<Object[]> out = new ArrayList<>();
+        for (Map<String, Object> c : loadCases()) {
+            out.add(new Object[] {(String) c.get("name"), c});
+        }
+        return out;
+    }
+
+    private final String caseName;
+    private final Map<String, Object> theCase;
+
+    /**
+     * One golden case.
+     *
+     * @param caseName case name (test label)
+     * @param theCase  parsed case object
+     */
+    public GoldenTest(String caseName, Map<String, Object> theCase) {
+        this.caseName = caseName;
+        this.theCase = theCase;
+    }
 
     @SuppressWarnings("unchecked")
     private static List<Map<String, Object>> loadCases() throws IOException {
@@ -56,10 +86,10 @@ public class GoldenTest {
         return new DiscountCurve(t, p);
     }
 
-    private final Map<String, DiscountCurve> bootCache = new HashMap<>();
+    private static final Map<String, DiscountCurve> BOOT_CACHE = new HashMap<>();
 
-    private DiscountCurve boot(String curveId) {
-        return bootCache.computeIfAbsent(curveId, id -> {
+    private static synchronized DiscountCurve boot(String curveId) {
+        return BOOT_CACHE.computeIfAbsent(curveId, id -> {
             if (id.equals("OIS")) {
                 return Bootstrap.bootstrap(Quotes.loadOisQuotes(DATA_DIR.resolve("ois_quotes.csv")));
             }
@@ -69,7 +99,7 @@ public class GoldenTest {
     }
 
     /** Compute the expected quantities for one golden case. */
-    private Map<String, Double> evaluate(String name, Map<String, Object> inp) {
+    private static Map<String, Double> evaluate(String name, Map<String, Object> inp) {
         Map<String, Double> out = new HashMap<>();
         if (name.startsWith("curve_")) {
             DiscountCurve c = curveFromInputs(inp);
@@ -98,6 +128,46 @@ public class GoldenTest {
             }
             return out;
         }
+        if (name.equals("vas_calib_sigma_fixed")) {
+            double[][] zy = Quotes.loadZeroYields(DATA_DIR.resolve("zero_yields.csv"));
+            Vasicek.Calibration cal = Vasicek.calibrate(
+                    zy[0], zy[1], num(inp, "r0"), null, 4000, num(inp, "sigma_fixed"));
+            assertTrue(cal.converged() && cal.identified() && !cal.atBound());
+            out.put("kappa", cal.kappa());
+            out.put("theta", cal.theta());
+            return out;
+        }
+        if (name.startsWith("bach_")) {
+            if (name.equals("bach_implied_vol_payer")) {
+                out.put("vol", Bachelier.impliedVol(num(inp, "price"), num(inp, "forward"),
+                        num(inp, "strike"), num(inp, "expiry"), num(inp, "annuity"), true));
+            } else {
+                out.put("price", Bachelier.price(num(inp, "forward"), num(inp, "strike"),
+                        num(inp, "expiry"), num(inp, "vol"), num(inp, "annuity"), true));
+            }
+            return out;
+        }
+        if (name.equals("hw_calib_recover")) {
+            DiscountCurve curve = curveFromInputs(inp);
+            List<HullWhite.CapletQuote> caps = new ArrayList<>();
+            for (int i = 1; inp.containsKey("cap_price_" + i); i++) {
+                caps.add(new HullWhite.CapletQuote(num(inp, "cap_reset_" + i),
+                        num(inp, "cap_pay_" + i), num(inp, "strike"), num(inp, "cap_price_" + i)));
+            }
+            double e = num(inp, "swpt_expiry");
+            int n = (int) Math.round(num(inp, "swpt_tenor_years"));
+            double[] pays = new double[n];
+            for (int k = 1; k <= n; k++) {
+                pays[k - 1] = e + k;
+            }
+            List<HullWhite.SwaptionQuote> swps = List.of(new HullWhite.SwaptionQuote(
+                    e, pays, num(inp, "swpt_fixed_rate"), num(inp, "swpt_price")));
+            HullWhite.Calibration cal = HullWhite.calibrate(curve, caps, swps, null, null, 4000);
+            assertTrue(cal.converged() && cal.identified() && !cal.atBound());
+            out.put("a", cal.a());
+            out.put("sigma", cal.sigma());
+            return out;
+        }
         if (name.startsWith("vas_")) {
             Vasicek m = new Vasicek(
                     num(inp, "kappa"), num(inp, "theta"), num(inp, "sigma"), num(inp, "r0"));
@@ -118,6 +188,8 @@ public class GoldenTest {
             HullWhite hw = new HullWhite(num(inp, "a"), num(inp, "sigma"), curveFromInputs(inp));
             switch (name) {
                 case "hw_zcb_t0" -> out.put("price", hw.zcbPrice(0.0, num(inp, "T")));
+                case "hw_zcb_t1_explicit_r" -> out.put("price",
+                        hw.zcbPrice(num(inp, "t"), num(inp, "T"), num(inp, "r")));
                 case "hw_caplet", "hw_caplet_sigma0" -> out.put("price", hw.caplet(
                         num(inp, "reset"), num(inp, "pay"), num(inp, "strike"),
                         num(inp, "notional")));
@@ -125,11 +197,12 @@ public class GoldenTest {
                         num(inp, "reset"), num(inp, "pay"), num(inp, "strike"),
                         num(inp, "notional")));
                 case "hw_cap_3y" -> {
-                    double[] sched = {num(inp, "t0"), num(inp, "t1"), num(inp, "t2"),
-                            num(inp, "t3")};
+                    // Schedule keys are s0..s3 (t1..t5 are the curve pillars).
+                    double[] sched = {num(inp, "s0"), num(inp, "s1"), num(inp, "s2"),
+                            num(inp, "s3")};
                     out.put("price", hw.cap(sched, num(inp, "strike"), num(inp, "notional")));
                 }
-                case "hw_swaption_payer", "hw_swaption_neg_curve" -> {
+                case "hw_swaption_payer", "hw_swaption_neg_curve", "hw_swaption_receiver" -> {
                     double expiry = num(inp, "expiry");
                     int n = (int) Math.round(num(inp, "tenor_years"));
                     double[] payTimes = new double[n];
@@ -137,8 +210,14 @@ public class GoldenTest {
                         payTimes[i - 1] = expiry + i;
                     }
                     HullWhite.JamshidianResult res = hw.jamshidianSwaption(
-                            expiry, payTimes, num(inp, "fixed_rate"), num(inp, "notional"), true);
+                            expiry, payTimes, num(inp, "fixed_rate"), num(inp, "notional"),
+                            !name.equals("hw_swaption_receiver"));
                     out.put("price", res.value());
+                    out.put("r_star", res.rStar());
+                    double[] strikes = res.strikes();
+                    for (int i = 0; i < strikes.length; i++) {
+                        out.put("strike_" + (i + 1), strikes[i]);
+                    }
                 }
                 case "hw_mc_caplet" -> out.put("price", hw.mcCaplet(
                         num(inp, "reset"), num(inp, "pay"), num(inp, "strike"),
@@ -153,27 +232,24 @@ public class GoldenTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    public void allGoldenCasesMatchWithinTolerance() throws IOException {
-        List<Map<String, Object>> cases = loadCases();
-        for (Map<String, Object> c : cases) {
-            String name = (String) c.get("name");
-            Map<String, Object> inputs = (Map<String, Object>) c.get("inputs");
-            Map<String, Object> expect = (Map<String, Object>) c.get("expect");
-            double tol = (Double) c.get("tol");
-            Map<String, Double> got = evaluate(name, inputs);
-            for (Map.Entry<String, Object> e : expect.entrySet()) {
-                assertTrue(name + ": missing output " + e.getKey(),
-                        got.containsKey(e.getKey()));
-                double expected = (Double) e.getValue();
-                assertEquals(name + "." + e.getKey(), expected, got.get(e.getKey()), tol);
-            }
+    public void caseMatchesWithinTolerance() {
+        Map<String, Object> inputs = (Map<String, Object>) theCase.get("inputs");
+        Map<String, Object> expect = (Map<String, Object>) theCase.get("expect");
+        double tol = (Double) theCase.get("tol");
+        Map<String, Double> got = evaluate(caseName, inputs);
+        for (Map.Entry<String, Object> e : expect.entrySet()) {
+            assertTrue(caseName + ": missing output " + e.getKey(),
+                    got.containsKey(e.getKey()));
+            double expected = (Double) e.getValue();
+            assertEquals(caseName + "." + e.getKey(), expected, got.get(e.getKey()), tol);
         }
     }
 
     @Test
     public void goldenFileHasExpectedCaseCount() throws IOException {
         List<Map<String, Object>> cases = loadCases();
-        assertTrue("expected >= 20 golden cases, got " + cases.size(), cases.size() >= 20);
+        assertEquals("expected exactly " + EXPECTED_CASES + " golden cases",
+                EXPECTED_CASES, cases.size());
         Set<String> names = new HashSet<>();
         for (Map<String, Object> c : cases) {
             assertTrue("duplicate golden case name", names.add((String) c.get("name")));

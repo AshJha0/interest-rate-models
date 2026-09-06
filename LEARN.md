@@ -153,8 +153,10 @@ instruments. Each instrument contributes one equation in the unknown DFs
   curve's short rate, each compounded coupon pays
   `DF(s_{i-1})/DF(s_i) - 1` and the floating leg again telescopes to
   `1 - DF(T)` — the residual is *identical in form* to the par swap. The
-  daily-vs-continuous gap is `O(r^2/365)` (≈ 0.8 bp of rate at r = 5%,
-  far below quote precision) and is a documented approximation.
+  daily-vs-continuous gap is `O(r^2/365)`: at r = 5% the exact daily
+  compounding gives `365·(e^{0.05/365} − 1) − 0.05 = 3.4e-6`, i.e.
+  ≈ 0.03 bp of rate — far below quote precision — and is a documented
+  approximation.
 
 ### 2.2 The sequential algorithm
 
@@ -166,15 +168,21 @@ interpolates on already-solved pillars (this is also how missing pillar
 gaps are handled: a 4y swap's 3.5y coupon just interpolates). Solve
 `residual(x) = 0` with Brent's method on the bracket `x ∈ [1e-10, 100]`
 (`xtol = 1e-14`). The wide bracket is deliberate: `DF > 1` must be
-reachable for negative rates.
+reachable for negative rates. Instrument maturities are bounded to
+`[1e-6, 200]` years at construction, so a maturity typed in days (a
+classic feed error) is rejected before any schedule is built.
 
-**Failure is informative.** If no sign change exists on `(0, 100]`, then
-*no positive discount factor can reprice the quote* — the inputs are
-crossed/arbitrageable (e.g. a deposit with `1 + RT ≤ 0`, or an FRA quote
-inconsistent with the surrounding curve implying a negative DF). The
-bootstrap raises an error naming the pillar rather than silently
-producing garbage. Detection at construction (`1 + RT > 0` checks) plus
-detection at solve time (bracketing failure) covers both.
+**Failure is informative — and correctly attributed.** If no sign change
+exists on `(0, 100]`, then *no positive discount factor can reprice the
+quote* — the inputs are crossed/arbitrageable (e.g. a deposit with
+`1 + RT ≤ 0`, or an FRA quote inconsistent with the surrounding curve
+implying a negative DF). The bootstrap raises an error naming the pillar
+and saying "crossed/arbitrageable quotes". Any *other* solver failure
+(a residual that evaluates to NaN, an exhausted iteration budget) is
+reported as "solver failed at pillar t=…" with the solver's own message —
+it is never relabelled as crossed quotes, because a wrong diagnosis at
+4:55 pm is undebuggable. Detection at construction (`1 + RT > 0`,
+maturity bounds) plus detection at solve time covers all three.
 
 Because each equation is solved exactly, the finished curve **reprices
 every input** — the round-trip test asserts `|residual| < 1e-9` for all
@@ -390,10 +398,47 @@ Put-call parity `ZBC - ZBP = P(0,S) - K\,P(0,T) = -0.00081902` holds to
 yields by least squares with a native Nelder-Mead (out-of-domain
 parameters get a smooth penalty; non-convergence is *reported* via a
 `converged` flag, never raised; `sigma` is returned as `|sigma|` since
-the objective is even in it). On the bundled `zero_yields.csv` —
-generated from a true `(0.8, 0.05, 0.02)` model plus seeded noise — the
-fit recovers `kappa=0.7977, theta=0.0501, sigma=0.0225` with RMSE
-1.7e-5.
+the objective is even in it). It runs from **three starting points**
+(`kappa ∈ {0.2, 0.5, 1.5}`, `theta = mean yield`, `sigma ∈ {0.005, 0.01,
+0.02}`), returns the lowest objective, and reports:
+
+* `at_bound` — the best vertex sits on the edge of the domain (`kappa <
+  1e-5`, `sigma < 1e-5`, …): a penalty-wall artefact, and `converged` is
+  forced to `False` in that case;
+* the spread of each parameter across the starts that fit *equally well*
+  (rmse within 5 % of the best), and `identified = True` only when those
+  spreads are tiny.
+
+**Yields identify Vasicek weakly.** A zero yield depends on `sigma` only
+through the convexity term `-\sigma^2 B^2/(4\kappa) - \sigma^2(B-\tau)/(2\kappa^2)`,
+which is second order, and `kappa` and `theta` trade off against each
+other along the curve's single hump. On the bundled `zero_yields.csv` —
+generated from a true `(0.8, 0.05, 0.02)` model plus N(0, 2e-5) noise —
+there are two least-squares minima:
+
+```
+start (0.5, ȳ, 0.01)  ->  kappa=0.7977  theta=0.0501  sigma=0.0225  rmse=1.732e-5
+start (0.2, ȳ, 0.005) ->  kappa=0.4114  theta=0.0688  sigma=0.0805  rmse=1.703e-5
+```
+
+The second has the *lower* rmse and is what the multi-start returns —
+with `identified = False`, `kappa_spread = 0.39`, `sigma_spread = 0.058`.
+Reporting the first as "recovering the true parameters" (as earlier
+versions of this document did) was a start-point artefact. The honest
+statement: 10 yields with 2e-5 noise cannot separate these two models.
+
+**The practitioner workflow** is therefore to pin `sigma` from option
+prices (caplets or swaptions — see §5.5) and fit only `(kappa, theta)`:
+
+```
+calibrate_vasicek(ts, ys, r0=0.03, sigma_fixed=0.02)
+  -> kappa=0.8002  theta=0.0500  rmse=1.738e-5  converged=True  identified=True
+```
+
+Every start now agrees to 1e-8 (golden `vas_calib_sigma_fixed`). A warm
+start `x0` (yesterday's parameters) is also supported — it runs a single
+start, which keeps day-to-day parameter paths continuous but reports
+`identified = False` because identifiability is then not assessed.
 
 But note what Vasicek *cannot* do: with three parameters its yield curve
 is a rigid one-hump/monotone family. It can never reproduce an arbitrary
@@ -504,11 +549,13 @@ harder than portfolios of options, but in any one-factor model where all
 bond prices move monotonically in the single state variable, Jamshidian's
 trick makes them equal:
 
-1. Because each `B(T,u_i) > 0`, the coupon-bond price
-   `g(r) = \sum_i c_i P(T,u_i;r)` is **strictly decreasing** in `r`.
-   Solve `g(r^*) = 1` — a 1-D Brent root find on an expanding bracket
-   (start `[-1,1]`, double the failing side, max 24 doublings); the tests
-   require `|g(r^*) - 1| < 1e-10`.
+1. For a positive fixed rate every coupon is positive and, because each
+   `B(T,u_i) > 0`, the coupon-bond price `g(r) = \sum_i c_i P(T,u_i;r)`
+   is **strictly decreasing** in `r`. Solve `g(r^*) = 1` — a 1-D Brent
+   root find on an expanding bracket (start `[-1,1]`, double the failing
+   side, max 24 doublings); the implementation then *enforces*
+   `|g(r^*) - 1| < 1e-10` and `g'(r^*) < 0` in every language (via the
+   public `jamshidian_at_r_star`), raising the standard error otherwise.
 2. Set decomposition strikes `K_i = P(T, u_i; r^*)`. By monotonicity, the
    swaption is in the money **iff** `r_T > r^*`, and on that event *every*
    ZCB put `(K_i - P(T,u_i))^+` is in the money simultaneously. So the
@@ -527,6 +574,23 @@ the root find gives `r^* = 0.0179465821`, strikes
 `2.4419483143080454`. The same code run on the negative-rate curve with
 `X = 0` (`hw_swaption_neg_curve`) gives `1.3848608836` with `r^*` *below
 zero* — Gaussian models don't care.
+
+**Negative fixed rates.** With `X < 0` (a real EUR/CHF case) the coupons
+are `(-, …, -, +)` and `g` is *not* monotone: `g' = -\sum c_i B_i P_i` is
+an exponential sum whose coefficients change sign once, so (by the
+Descartes-type bound for exponential sums) `g'` has at most one zero and
+`g` has a single minimum. But exactness only needs `g - 1` to change
+sign **once**: `g → +∞` as `r → -∞` (the last, positive coupon has the
+largest `B`), `g → 0^-` as `r → +∞`, and the minimum lies below 0, so
+`g` still crosses 1 exactly once, on its decreasing branch. The
+decomposition therefore stays exact for every `X` with `1 + X\tau_n > 0`
+— the tests confirm it against direct numerical integration of the
+payoff under the `T`-forward measure for `X = -0.005, -0.2, -0.5` to
+1e-9 relative. If `1 + X\tau_n \le 0` every coupon is non-positive,
+`g < 1` everywhere and no `r^*` exists ("degenerate coupon bond"). Around
+`X < -0.9` on the golden curve the coupon-bond terms reach O(1e8) and
+`|g(r^*)|` cannot beat 1e-10 in double precision; the residual contract
+rejects such inputs rather than pricing them.
 
 The decomposition is exact only in one-factor models — with two factors,
 bonds of different maturities are no longer comonotone and the trick
@@ -553,6 +617,52 @@ Consequences worth internalizing:
   at 50,000 paths, SE ≈ 1.2e-4 on a 0.877 price for `vas_mc_zcb`).
 * `sigma = 0` short-circuits to the deterministic decay: MC equals the
   analytic price with SE exactly 0 (asserted in tests).
+* The step moments must be evaluated carefully: `Var[\int x]` is
+  `(\sigma^2/a^2)(dt - 2b + (1-e^{-2a\,dt})/(2a))`, three O(dt) terms
+  cancelling to O(a^2 dt^3). In plain double arithmetic the result is
+  3 % wrong at `a\,dt = 10^{-5}` and 80x too large at `a\,dt = 10^{-7}`
+  (daily steps with a slow mean reversion). The kernel therefore uses
+  `expm1` and, below `a\,dt = 10^{-2}`, the series
+  `\sigma^2 dt^3 (1/3 - x/4 + 7x^2/60 - x^3/24 + 31x^4/2520 - x^5/320)`;
+  the tests check it against 60-digit arithmetic and run a 2000-step MC
+  with `\kappa = 10^{-3}` that must stay unbiased.
+
+### 5.5 Calibrating Hull-White and quoting in normal (bp) volatility
+
+Hull-White's `theta(t)` matches the curve; `a` and `sigma` are free to
+match option prices. `calibrate_hullwhite(curve, caplets, swaptions)`
+minimises the sum of squared price errors (per unit notional) over a set
+of caplet quotes `(reset, pay, strike, price)` and payer-swaption quotes
+`(expiry, pay_times, fixed_rate, price)`, using the §5.2–5.3 closed forms
+inside the same native Nelder-Mead, from three starts, with the same
+`at_bound` / `identified` diagnostics as the Vasicek fit. A single quote
+fits `sigma` for *any* `a` (a ridge), which the diagnostics report as
+`identified = False`; two quotes of different expiry/tenor pin both. The
+common desk variant is `a_fixed` (fix mean reversion from the
+swaption-matrix shape or by policy, fit `sigma` only — a 1-D problem).
+
+Market quotes arrive as **normal ("bp") volatilities**, not prices. In
+the Bachelier model the forward `F` is Gaussian with absolute volatility
+`\sigma_N`, so a payer option with strike `K`, expiry `T` and annuity `A`
+(`A = \tau\,DF(T_{pay})` for a caplet, `\sum_i \tau_i DF(u_i)` for a
+swaption) is worth
+
+$$
+A\left[(F-K)\,N(d) + \sigma_N\sqrt{T}\,\phi(d)\right],
+\qquad d = \frac{F-K}{\sigma_N\sqrt{T}}
+$$
+
+— negative forwards and strikes are no problem, which is why the market
+switched from lognormal to normal quotes once rates went negative. The
+price is strictly increasing in `\sigma_N`, so `bachelier_implied_vol`
+inverts it uniquely with Brent. The demo calibrates `(a, \sigma) =
+(0.08, 0.012)` from four USD quotes and reports the model's caplet vols
+as 116, 111 and 103 bp and the 1y-into-5y swaption at 100 bp: the
+decreasing term structure of caplet vols is the mean-reversion effect of
+§3 made visible in market units. Note the two vols live in different
+models: Hull-White's `\sigma` is the short-rate vol; `\sigma_N` is the
+implied vol of one instrument's forward under the normal model, and
+converting between them is exactly what the calibration does.
 
 ---
 
@@ -600,7 +710,43 @@ pillar you would be bumping across.
 
 ---
 
-## 7. Market conventions: where this project simplifies desk practice
+## 7. How a desk would use this
+
+A concrete end-of-day workflow that stays inside what the package
+verifies, with the checks a risk manager would insist on:
+
+1. **Build the discount curve.** Load the day's OIS quotes
+   (`load_ois_quotes` → `bootstrap`). The bootstrap either reprices every
+   quote to < 1e-9 or raises naming the pillar; a "crossed/arbitrageable
+   quotes" message means the *inputs* are wrong (check the quote, its
+   neighbours, units), a "solver failed" message means something else is
+   wrong and needs a human. Never catch and continue.
+2. **Mark the model to options.** Convert broker bp vols to prices with
+   `bachelier_price` (forward from `curve.fwd_rate` / `par_swap_rate`,
+   annuity from the curve) and run `calibrate_hullwhite`. Accept the
+   result only if `converged and not at_bound and (identified or a_fixed)`;
+   log `rmse` and the spreads. With a fixed `a` the fit is 1-D and
+   effectively instantaneous.
+3. **Price and risk.** `caplet` / `cap` / `jamshidian_swaption` give
+   analytic prices; check `residual` is reported (the contract already
+   enforced it) and that MC (`mc_caplet`) agrees within 3 SE on a spot
+   check. DV01 is bump-and-reprice in quote space (§6, COOKBOOK recipe
+   12): re-bootstrap with one quote bumped by 1 bp, reprice; keyed
+   sensitivities localise by construction.
+4. **Express results in market units.** `bachelier_implied_vol` turns any
+   model price back into a bp vol for comparison with the broker screen —
+   the model is wrong where the vols disagree, and that difference is the
+   quantity a trader actually looks at.
+5. **What you must add before production.** Real day counts and
+   calendars (the package uses ACT/365F on a continuous axis), multi-curve
+   projection for term-rate swaps, smile (Gaussian models have none), and
+   a time-dependent `sigma(t)` if the whole swaption matrix must be
+   matched. Everything in the list of "deliberately out of scope" items in
+   the README is a data-preparation or model-extension step, not a bug.
+
+---
+
+## 8. Market conventions: where this project simplifies desk practice
 
 Each simplification is deliberate — the model content is unchanged, and
 each is a data-preparation issue, but you must know them before comparing
@@ -623,7 +769,7 @@ Bermudans (via trees/PDE on the same dynamics) and quick swaption risk.
 
 ---
 
-## 8. Common pitfalls and numerical issues
+## 9. Common pitfalls and numerical issues
 
 1. **theta(t) spikes at pillars — by design, not by bug.** With
    piecewise-constant forwards, `f^M(0,t)` *jumps* at each pillar, so the
@@ -636,15 +782,22 @@ Bermudans (via trees/PDE on the same dynamics) and quick swaption risk.
    discretize `theta(t)` on a tree/PDE grid.
 2. **Finite-difference contracts must be bit-identical across ports.**
    `f^M(0,t)` is defined *by its stencil* (`h = 1e-5`, central/one-sided
-   split). A port that "improves" it to an analytic slope will disagree
-   with golden values at `t > 0` where the stencil straddles a pillar
-   (it averages the two adjacent forwards). Treat numerical schemes in a
-   contract as part of the model.
-3. **Root-find brackets encode no-arbitrage.** The bootstrap bracket
-   `DF ∈ [1e-10, 100]` fails exactly when quotes are crossed; the
-   Jamshidian bracket expansion fails only for degenerate coupon bonds
-   (e.g. absurd fixed rates). Report *which pillar* failed — a bare
-   "no sign change" is undebuggable at 4:55pm.
+   split). Pinned *prices* do not depend on it (they use market DFs, and
+   the swaption strikes shift together with `r^*`), but `P(t>0,T;r)` with
+   an explicit `r`, the reported `r^*`, the decomposition strikes and
+   `theta(t)` do — and the golden suite pins those too
+   (`hw_zcb_t1_explicit_r`, `hw_swaption_payer.r_star`). A port that
+   "improves" the stencil to an analytic slope will fail them where the
+   stencil straddles a pillar. Treat numerical schemes in a contract as
+   part of the model.
+3. **Root-find brackets encode no-arbitrage — but only bracketing
+   failures do.** The bootstrap bracket `DF ∈ [1e-10, 100]` fails exactly
+   when quotes are crossed; the Jamshidian bracket expansion fails only
+   for degenerate coupon bonds (`1 + X\tau_n \le 0`). Report *which
+   pillar* failed, and never relabel a NaN residual or an exhausted
+   iteration budget as "crossed quotes" — a wrong diagnosis at 4:55pm is
+   worse than none. The root finders themselves refuse non-finite
+   function values: a NaN used to be silently returned as a root.
 4. **`sigma_p = 0` needs an explicit branch.** `sigma = 0`, `T = 0` and
    `S = T` all make the Black-style formula 0/0; the option must return
    forward intrinsic. Tests pin all three degenerations.
@@ -652,12 +805,16 @@ Bermudans (via trees/PDE on the same dynamics) and quick swaption risk.
    every negative-rate curve. The invariants are `DF > 0` and (per
    segment) whatever sign the forward implies — the tests assert `DF > 1`
    *is supported*.
-6. **Nelder-Mead converges to wherever it converges.** The Vasicek
-   least-squares surface is nearly flat in `kappa` x `sigma` for short
-   maturity sets (yields depend on `sigma` only through convexity, which
-   is tiny). Use domain penalties (not hard throws — the simplex must be
-   able to wander), report `converged`, return `|sigma|`, and never trust
-   a calibration you haven't repriced.
+6. **Nelder-Mead converges to wherever it converges — and "converged" is
+   not "correct".** The Vasicek least-squares surface has two minima on
+   the bundled data (§4.4), and a start inside the penalty region walks to
+   the domain wall (`kappa = 10^{-6}`) and stops there with the optimiser
+   happily reporting convergence. Use domain penalties (not hard throws —
+   the simplex must be able to wander), run several starts, flag
+   `at_bound` and set `converged = False` there, report the parameter
+   spread across equally-good starts (`identified`), return `|sigma|`,
+   pin `sigma` from options when yields are the only input, and never
+   trust a calibration you haven't repriced.
 7. **Sample-vs-population standard errors.** MC SE uses `ddof = 1`; with
    50,000 paths it hardly matters, but golden bands are calibrated to the
    sample convention — a port using `ddof = 0` differs in the 5th digit
@@ -671,10 +828,21 @@ Bermudans (via trees/PDE on the same dynamics) and quick swaption risk.
    the implicit `(0, DF=1)` node must not be user-suppliable. Off-by-one
    segment lookups at pillars (left vs right segment for `f`) are the
    classic silent bug — the spec pins "right segment at a pillar".
+10. **`1 - e^{-x}` is `-expm1(-x)`, and some differences need a series.**
+    `B(\tau)`, `Var[r_T]`, `sigma_p`, `alpha(t)` are all fine with
+    `expm1`; the integrated-OU variance and `V(t)` are not, because three
+    O(dt) terms cancel to O(a^2 dt^3) — see §5.4. The symptom was a
+    "harmless" `max(var, 0)` guard turning garbage into zero.
+11. **Validate the boring inputs too.** A NaN notional from a position
+    feed used to propagate straight into a book-level PV sum; a maturity
+    of `1e12` (days typed as years) used to allocate gigabytes (Java),
+    panic (Rust) or be undefined behaviour (C++ float→int). Every public
+    entry point now rejects NaN/inf and out-of-range sizes with the
+    language's standard error.
 
 ---
 
-## 9. Interview-style Q&A
+## 10. Interview-style Q&A
 
 **Q1. Why does log-linear DF interpolation equal piecewise-constant
 forwards, and why do traders like it?**
@@ -777,7 +945,7 @@ desks avoid splines for risk curves.
 
 ---
 
-## 10. Further reading
+## 11. Further reading
 
 * **Brigo & Mercurio**, *Interest Rate Models — Theory and Practice*
   (2nd ed., Springer 2006) — the reference for everything here: affine
@@ -793,11 +961,18 @@ desks avoid splines for risk curves.
   *JFE* 5, 1977. **Hull & White**, "Pricing Interest-Rate-Derivative
   Securities", *RFS* 3, 1990. **Jamshidian**, "An Exact Bond Option
   Formula", *Journal of Finance* 44, 1989 — the three primary sources.
+  **Bachelier**, "Théorie de la spéculation", *Ann. Sci. ENS* 17, 1900 —
+  the normal option model behind bp-vol quotes.
 * **Bianchetti & Carlicchi**, "Interest Rates After the Credit Crunch:
   Multiple Curve Vanilla Derivatives and SABR" (2011) — readable
   multi-curve overview.
 * **Glasserman**, *Monte Carlo Methods in Financial Engineering*
-  (Springer 2003) — ch. 3.3 for exact Gaussian simulation of OU/Vasicek.
+  (Springer 2003) — ch. 3.3 for exact Gaussian simulation of OU/Vasicek;
+  **Gillespie**, "Exact numerical simulation of the Ornstein-Uhlenbeck
+  process and its integral", *Phys. Rev. E* 54, 1996 — the joint
+  `(x, \int x)` transition used here.
 * For the LIBOR transition and RFR conventions: **Schrimpf & Sushko**,
   "Beyond LIBOR: a primer on the new benchmark rates", *BIS Quarterly
   Review*, March 2019.
+
+Full citations with DOIs/URLs are in the README's References section.

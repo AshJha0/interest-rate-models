@@ -1,24 +1,31 @@
 sequenceDiagram
   participant U as caller
   participant B as bootstrap
+  participant S as solve_pillar_df
   participant R as brentq
   participant C as trial DiscountCurve
   participant I as instrument_k
 
   U->>B: bootstrap([ins_1 .. ins_n]) sorted by pillar
-  B->>B: validate strictly increasing pillars
+  B->>B: validate strictly increasing pillars (maturities already in [1e-6, 200] y)
   loop for each instrument k = 1..n
-    B->>R: solve f(x) = residual on [1e-10, 100]
-    loop Brent iterations
+    B->>S: solve residual(DF) = 0 on [1e-10, 100]
+    S->>R: brentq(residual, 1e-10, 100, xtol 1e-14)
+    loop Brent iterations (<= 100)
       R->>C: build curve(solved pillars + (pillar_k, x))
       C-->>I: df(t) at cashflow dates (interpolated)
       I-->>R: residual(trial curve)
+      R->>R: reject non-finite residual (error)
     end
     alt no sign change on bracket
-      R-->>B: error "root not bracketed"
-      B-->>U: error naming pillar_k (crossed quotes)
+      R-->>S: error "root not bracketed"
+      S-->>U: error naming pillar_k: "crossed/arbitrageable quotes"
+    else non-finite residual or iteration budget exhausted
+      R-->>S: error "not finite" / "no convergence"
+      S-->>U: error naming pillar_k: "solver failed" (never relabelled)
     else converged
-      R-->>B: DF(pillar_k), |residual| < 1e-14
+      R-->>S: DF(pillar_k), |residual| < 1e-14
+      S-->>B: DF(pillar_k)
       B->>B: append pillar to solved set
     end
   end

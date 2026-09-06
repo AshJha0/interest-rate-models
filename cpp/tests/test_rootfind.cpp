@@ -66,4 +66,24 @@ TEST(Bisect, ReversedBracketAccepted) {
     EXPECT_NEAR(r, 0.5, 1e-11);
 }
 
+TEST(Bisect, NonConvergenceIsError) {
+    EXPECT_THROW(irm::bisect([](double x) { return x - 0.3; }, 0.0, 1.0, 1e-300, 5),
+                 std::domain_error);
+    EXPECT_THROW(irm::bisect([](double x) { return x; }, 0.0, std::nan("")), std::invalid_argument);
+    EXPECT_THROW(irm::bisect([](double x) { return x; }, -1.0, 1.0, 0.0), std::invalid_argument);
+    EXPECT_NEAR(irm::bisect([](double x) { return x - 0.25; }, 0.0, 1.0), 0.25, 1e-11);
+}
+
+TEST(RootFind, NonFiniteFunctionValuesRejected) {
+    // A NaN residual must never be returned as a "root" or misreported as a
+    // bracketing failure.
+    EXPECT_THROW(irm::brentq([](double x) { return (x > 0.2 && x < 0.8) ? std::nan("")
+                                                                         : (x < 0.5 ? 1.0 : -1.0); },
+                             0.0, 1.0),
+                 std::domain_error);
+    EXPECT_THROW(irm::brentq([](double) { return std::nan(""); }, 0.0, 1.0), std::domain_error);
+    EXPECT_THROW(irm::bisect([](double x) { return x > 0.4 ? INFINITY : -1.0; }, 0.0, 1.0),
+                 std::domain_error);
+}
+
 }  // namespace

@@ -19,6 +19,19 @@ public final class RootFind {
     private RootFind() {
     }
 
+    /**
+     * Rejects NaN/inf function values: a silent NaN would otherwise be
+     * treated as "same sign" and either misreported as a bracketing failure
+     * or, worse, returned as a converged root.
+     */
+    private static double finiteValue(String who, double x, double fx) {
+        if (!Double.isFinite(fx)) {
+            throw new IllegalArgumentException(
+                    who + ": function value not finite at x=" + x + ": " + fx);
+        }
+        return fx;
+    }
+
     /** {@link #brentq(DoubleUnaryOperator, double, double, double, double, int)}
      *  with defaults {@code xtol = 1e-14, rtol = 4.44e-16, maxiter = 100}. */
     public static double brentq(DoubleUnaryOperator f, double a, double b) {
@@ -39,7 +52,9 @@ public final class RootFind {
      * zbrent convention).</p>
      *
      * @throws IllegalArgumentException on a non-finite bracket, non-positive
-     *     xtol, an unbracketed root, or non-convergence after maxiter
+     *     xtol, an unbracketed root, a non-finite function value anywhere, or
+     *     non-convergence after maxiter (an unconverged or NaN root is never
+     *     returned)
      */
     public static double brentq(
             DoubleUnaryOperator f, double a, double b, double xtol, double rtol, int maxiter) {
@@ -49,8 +64,8 @@ public final class RootFind {
         if (xtol <= 0.0) {
             throw new IllegalArgumentException("brentq: xtol must be positive");
         }
-        double fa = f.applyAsDouble(a);
-        double fb = f.applyAsDouble(b);
+        double fa = finiteValue("brentq", a, f.applyAsDouble(a));
+        double fb = finiteValue("brentq", b, f.applyAsDouble(b));
         if (fa == 0.0) {
             return a;
         }
@@ -122,7 +137,7 @@ public final class RootFind {
             } else {
                 b += (xm > 0.0) ? tol1 : -tol1;
             }
-            fb = f.applyAsDouble(b);
+            fb = finiteValue("brentq", b, f.applyAsDouble(b));
         }
         throw new IllegalArgumentException("brentq: no convergence after " + maxiter + " iterations");
     }
@@ -135,17 +150,22 @@ public final class RootFind {
 
     /**
      * Plain bisection on {@code [a, b]}; robust fallback, linear convergence.
+     * Same bracket contract as {@link #brentq}.
      *
-     * @throws IllegalArgumentException on a non-finite bracket or an
-     *     unbracketed root
+     * @throws IllegalArgumentException on a non-finite bracket, non-positive
+     *     xtol, an unbracketed root, a non-finite function value, or
+     *     non-convergence after maxiter
      */
     public static double bisect(
             DoubleUnaryOperator f, double a, double b, double xtol, int maxiter) {
         if (!(Double.isFinite(a) && Double.isFinite(b))) {
             throw new IllegalArgumentException("bisect: bracket endpoints must be finite");
         }
-        double fa = f.applyAsDouble(a);
-        double fb = f.applyAsDouble(b);
+        if (xtol <= 0.0) {
+            throw new IllegalArgumentException("bisect: xtol must be positive");
+        }
+        double fa = finiteValue("bisect", a, f.applyAsDouble(a));
+        double fb = finiteValue("bisect", b, f.applyAsDouble(b));
         if (fa == 0.0) {
             return a;
         }
@@ -161,7 +181,7 @@ public final class RootFind {
         double flo = (a < b) ? fa : fb;
         for (int it = 0; it < maxiter; it++) {
             double mid = 0.5 * (lo + hi);
-            double fm = f.applyAsDouble(mid);
+            double fm = finiteValue("bisect", mid, f.applyAsDouble(mid));
             if (fm == 0.0 || 0.5 * (hi - lo) < xtol) {
                 return mid;
             }
@@ -172,6 +192,6 @@ public final class RootFind {
                 hi = mid;
             }
         }
-        return 0.5 * (lo + hi);
+        throw new IllegalArgumentException("bisect: no convergence after " + maxiter + " iterations");
     }
 }

@@ -18,6 +18,16 @@ __all__ = ["brentq", "bisect"]
 _RTOL = 4.44e-16
 
 
+def _finite_value(who: str, x: float, fx: float) -> float:
+    """Reject NaN/inf function values: a silent NaN would otherwise be
+    treated as "same sign" and either misreported as a bracketing failure
+    or, worse, returned as a converged root."""
+    fx = float(fx)
+    if not math.isfinite(fx):
+        raise ValueError(f"{who}: function value not finite at x={x}: {fx}")
+    return fx
+
+
 def brentq(
     f: Callable[[float], float],
     a: float,
@@ -31,14 +41,16 @@ def brentq(
     ``f(a)`` and ``f(b)`` must have opposite signs (or one endpoint be an
     exact root); otherwise a ``ValueError`` is raised.  Convergence tolerance
     on the abscissa is ``2*rtol*|x| + xtol/2`` (Numerical-Recipes zbrent
-    convention).
+    convention).  A non-finite function value anywhere, or exhausting
+    ``maxiter`` (at most 100 by default; every call is bounded), raises
+    ``ValueError`` — an unconverged root is never returned.
     """
     if not (math.isfinite(a) and math.isfinite(b)):
         raise ValueError("brentq: bracket endpoints must be finite")
     if xtol <= 0.0:
         raise ValueError("brentq: xtol must be positive")
-    fa = f(a)
-    fb = f(b)
+    fa = _finite_value("brentq", a, f(a))
+    fb = _finite_value("brentq", b, f(b))
     if fa == 0.0:
         return a
     if fb == 0.0:
@@ -89,7 +101,7 @@ def brentq(
             b += d
         else:
             b += tol1 if xm > 0.0 else -tol1
-        fb = f(b)
+        fb = _finite_value("brentq", b, f(b))
     raise ValueError(f"brentq: no convergence after {maxiter} iterations")
 
 
@@ -100,11 +112,18 @@ def bisect(
     xtol: float = 1e-12,
     maxiter: int = 200,
 ) -> float:
-    """Plain bisection on ``[a, b]``; robust fallback, linear convergence."""
+    """Plain bisection on ``[a, b]``; robust fallback, linear convergence.
+
+    Same bracket contract as :func:`brentq`: endpoints finite, a sign change
+    (or an exact endpoint root) required, non-finite function values and
+    exhausting ``maxiter`` are errors.
+    """
     if not (math.isfinite(a) and math.isfinite(b)):
         raise ValueError("bisect: bracket endpoints must be finite")
-    fa = f(a)
-    fb = f(b)
+    if xtol <= 0.0:
+        raise ValueError("bisect: xtol must be positive")
+    fa = _finite_value("bisect", a, f(a))
+    fb = _finite_value("bisect", b, f(b))
     if fa == 0.0:
         return a
     if fb == 0.0:
@@ -117,11 +136,11 @@ def bisect(
     flo = fa if a < b else fb
     for _ in range(maxiter):
         mid = 0.5 * (lo + hi)
-        fm = f(mid)
+        fm = _finite_value("bisect", mid, f(mid))
         if fm == 0.0 or 0.5 * (hi - lo) < xtol:
             return mid
         if (fm > 0.0) == (flo > 0.0):
             lo, flo = mid, fm
         else:
             hi = mid
-    return 0.5 * (lo + hi)
+    raise ValueError(f"bisect: no convergence after {maxiter} iterations")
